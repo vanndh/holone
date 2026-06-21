@@ -1,0 +1,1 @@
+netsh interface ipv4 set dnsservers name="Wi-Fi" static 1.1.1.1 primary

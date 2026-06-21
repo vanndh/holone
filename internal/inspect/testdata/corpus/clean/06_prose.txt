@@ -1,0 +1,1 @@
+Run make test to execute the suite, then open a pull request.

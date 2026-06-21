@@ -1,0 +1,244 @@
+{
+  "version": 2,
+  "note": "Behavioral detection rules for malicious LLM-provider response injection. Patterns are Go RE2 regular expressions (no lookaround/backreferences). Each match against assistant text, tool_use input, or tool_call arguments produces a Finding. Severity guidance: 'high' = download+execute, anti-forensics, traffic hijack, LOLBin staging, or known IOC (Block mode strips these and unsolicited tool calls). 'medium' = dual-use actions (plain download, route/proxy/cron config) that warrant an alert but not auto-stripping. 'low' = weak signals. Community PRs welcome.",
+  "rules": [
+    {
+      "id": "dl-curl-pipe-sh",
+      "category": "download-exec",
+      "severity": "high",
+      "pattern": "(?i)\\b(curl|wget)\\b[^|\\n]*\\|\\s*(sudo\\s+)?(ba)?sh\\b",
+      "description": "Remote payload piped directly into a shell (curl ... | sh)"
+    },
+    {
+      "id": "dl-fetch-pipe-iex",
+      "category": "download-exec",
+      "severity": "high",
+      "pattern": "(?i)\\b(iwr|irm|curl|wget|invoke-webrequest|invoke-restmethod)\\b[^|\\n]*\\|\\s*(iex|invoke-expression)\\b",
+      "description": "Remote payload piped into Invoke-Expression (IWR ... | IEX)"
+    },
+    {
+      "id": "dl-webclient-download",
+      "category": "download-exec",
+      "severity": "medium",
+      "pattern": "(?i)\\b(downloadstring|downloadfile|downloaddata)\\b",
+      "description": "WebClient.Download* call (download staging; medium because also used legitimately)"
+    },
+    {
+      "id": "dl-net-webclient-ref",
+      "category": "download-exec",
+      "severity": "medium",
+      "pattern": "(?i)\\b(system\\.)?net\\.webclient\\b",
+      "description": "Net.WebClient reference (download cradle, incl. reflection/string-concat invocation)"
+    },
+    {
+      "id": "dl-iex-newobject-webclient",
+      "category": "download-exec",
+      "severity": "high",
+      "pattern": "(?i)\\b(iex|invoke-expression)\\b[\\s\\S]{0,80}?new-object[\\s\\S]{0,40}?net\\.webclient",
+      "description": "IEX(New-Object Net.WebClient) download cradle"
+    },
+    {
+      "id": "dl-bitsadmin",
+      "category": "download-exec",
+      "severity": "high",
+      "pattern": "(?i)\\bbitsadmin\\b[^\\n]*\\/transfer\\b|\\bstart-bitstransfer\\b",
+      "description": "BITS used to fetch a remote file (LOLBin)"
+    },
+    {
+      "id": "dl-certutil",
+      "category": "download-exec",
+      "severity": "high",
+      "pattern": "(?i)\\bcertutil\\b[^\\n]*\\b(-?urlcache|/urlcache|-split|/split|-verifyctl|/verifyctl|-decode|/decode)\\b",
+      "description": "certutil download/decode cradle (LOLBin staging)"
+    },
+    {
+      "id": "exec-regsvr32-scriptlet",
+      "category": "download-exec",
+      "severity": "medium",
+      "pattern": "(?i)\\bregsvr32\\b[^\\n]*(/i:|http|\\.sct\\b)",
+      "description": "regsvr32 scriptlet / squiblydoo proxy execution"
+    },
+    {
+      "id": "exec-vbs-wscript",
+      "category": "download-exec",
+      "severity": "medium",
+      "pattern": "(?i)\\b(wscript|cscript|mshta)\\b[^\\n]*\\.(vbs|js|hta)\\b|\\bmshta\\b[^\\n]*http",
+      "description": "Script host / mshta execution"
+    },
+    {
+      "id": "exec-rundll32",
+      "category": "download-exec",
+      "severity": "medium",
+      "pattern": "(?i)\\brundll32\\b[^\\n]*(javascript:|http)",
+      "description": "rundll32 proxy execution"
+    },
+    {
+      "id": "obf-encoded-command",
+      "category": "obfuscation",
+      "severity": "high",
+      "pattern": "(?i)\\s-e(c|nc|ncoded|ncodedcommand)\\b\\s+[A-Za-z0-9+/=]{16,}|\\s-e\\s+[A-Za-z0-9+/=]{30,}",
+      "description": "Encoded command flag with base64 blob (binary-name independent)"
+    },
+    {
+      "id": "obf-scriptblock-create",
+      "category": "obfuscation",
+      "severity": "high",
+      "pattern": "(?i)\\bscriptblock\\b\\s*\\]?\\s*::\\s*create\\b",
+      "description": "Dynamic code execution via ScriptBlock::Create (IEX substitute)"
+    },
+    {
+      "id": "obf-caret-backtick",
+      "category": "obfuscation",
+      "severity": "medium",
+      "pattern": "(\\^\\w){3,}|(`\\w){4,}",
+      "description": "Caret/backtick token-splitting obfuscation (p^o^w^e^r^s^h^e^l^l)"
+    },
+    {
+      "id": "obf-frombase64",
+      "category": "obfuscation",
+      "severity": "low",
+      "pattern": "(?i)\\bfrombase64string\\b",
+      "description": "Base64 decode (weak signal; common in benign code)"
+    },
+    {
+      "id": "obf-hidden-window",
+      "category": "obfuscation",
+      "severity": "medium",
+      "pattern": "(?i)-w(indowstyle)?\\s+hidden\\b",
+      "description": "Hidden window style (stealth execution)"
+    },
+    {
+      "id": "obf-iex-generic",
+      "category": "obfuscation",
+      "severity": "medium",
+      "pattern": "(?i)\\binvoke-expression\\b|\\biex\\s*\\(|\\|\\s*iex\\b|\\biex\\s+[\"'$]",
+      "description": "Invoke-Expression of dynamic content (excludes the Elixir 'iex' REPL)"
+    },
+    {
+      "id": "persist-schtasks-create",
+      "category": "persistence",
+      "severity": "high",
+      "pattern": "(?i)\\bschtasks\\b[^\\n]*\\/create\\b",
+      "description": "Scheduled task creation (persistence)"
+    },
+    {
+      "id": "persist-register-scheduledtask",
+      "category": "persistence",
+      "severity": "high",
+      "pattern": "(?i)\\b(register|new)-scheduledtask\\b",
+      "description": "PowerShell scheduled task registration (persistence)"
+    },
+    {
+      "id": "persist-com-schtasks",
+      "category": "persistence",
+      "severity": "high",
+      "pattern": "(?i)\\bschedule\\.service\\b|\\bregistertaskdefinition\\b",
+      "description": "Scheduled-task persistence via COM (Schedule.Service)"
+    },
+    {
+      "id": "persist-run-key",
+      "category": "persistence",
+      "severity": "medium",
+      "pattern": "(?i)currentversion\\\\\\\\?run(once)?\\b|\\breg\\b\\s+add\\b[^\\n]*\\brun(once)?\\b",
+      "description": "Registry Run key autostart (dual-use: also legitimate self-startup)"
+    },
+    {
+      "id": "persist-cron",
+      "category": "persistence",
+      "severity": "medium",
+      "pattern": "(?i)/etc/cron\\.(d|daily|hourly|weekly|monthly)/|/var/spool/cron/|\\bcrontab\\b[^\\n]*(curl|wget|http|/tmp/|base64|\\|\\s*sh)",
+      "description": "cron persistence with a fetch/temp/pipe indicator (Linux)"
+    },
+    {
+      "id": "persist-launchagent",
+      "category": "persistence",
+      "severity": "medium",
+      "pattern": "(?i)launchagents|launchdaemons|launchctl\\s+load",
+      "description": "launchd persistence (macOS)"
+    },
+    {
+      "id": "net-tun2socks",
+      "category": "network",
+      "severity": "high",
+      "pattern": "(?i)\\btun2socks\\b",
+      "description": "tun2socks (transparent traffic redirection through a proxy)"
+    },
+    {
+      "id": "net-socks-url",
+      "category": "network",
+      "severity": "high",
+      "pattern": "(?i)\\bsocks[45]?[ah]?:\\/\\/",
+      "description": "SOCKS proxy endpoint reference (incl. socks5h / socks4a)"
+    },
+    {
+      "id": "net-route-add",
+      "category": "network",
+      "severity": "low",
+      "pattern": "(?i)\\broute\\b\\s+(-p\\s+)?(add|change)\\b|\\bip\\b\\s+route\\s+add\\b",
+      "description": "Routing table manipulation (weak/dual-use signal)"
+    },
+    {
+      "id": "net-new-netroute",
+      "category": "network",
+      "severity": "low",
+      "pattern": "(?i)\\b(new|set)-netroute\\b",
+      "description": "Routing-table change via PowerShell cmdlet (weak/dual-use signal)"
+    },
+    {
+      "id": "net-disable-ipv6",
+      "category": "network",
+      "severity": "high",
+      "pattern": "(?i)disable-netadapterbinding\\b[^\\n]*(ms_tcpip6|ipv6)|\\bdisabledcomponents\\b|tcpip6\\\\\\\\parameters|set-netadapterbinding\\b[^\\n]*-enabled\\s+\\$?false",
+      "description": "Disabling IPv6 (proxy leak prevention)"
+    },
+    {
+      "id": "net-set-dns",
+      "category": "network",
+      "severity": "high",
+      "pattern": "(?i)\\bset-dnsclientserveraddress\\b|netsh\\b[^\\n]*\\binterface\\b[^\\n]*\\b(set|add)\\b[^\\n]*\\bdns",
+      "description": "DNS server override (traffic redirection)"
+    },
+    {
+      "id": "net-system-proxy",
+      "category": "network",
+      "severity": "high",
+      "pattern": "(?i)netsh\\b[^\\n]*winhttp[^\\n]*proxy|\\bset-itemproperty\\b[^\\n]*proxyserver|internet\\s*settings[^\\n]*proxyenable|\\bautoconfigurl\\b|\\b(https?_proxy|all_proxy)\\b\\s*=",
+      "description": "System-wide HTTP/SOCKS proxy configuration"
+    },
+    {
+      "id": "af-clear-eventlog",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)\\bclear-eventlog\\b",
+      "description": "Clearing Windows event logs"
+    },
+    {
+      "id": "af-wevtutil-cl",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)\\bwevtutil\\b\\s+cl\\b|\\bwevtutil\\b[^\\n]*\\bclear-log\\b",
+      "description": "Clearing event logs via wevtutil"
+    },
+    {
+      "id": "af-psreadline-wipe",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)\\bclear-history\\b|consolehost_history|historysavepath|set-psreadlineoption[^\\n]*savenothing|psreadline[\\s\\S]{0,60}(remove|clear|savenothing|delete)",
+      "description": "Wiping PowerShell command history"
+    },
+    {
+      "id": "af-disable-scriptblocklogging",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)enablescriptblocklogging[^\\n]{0,20}(0|\\$?false)|(disable|remove|stop)[^\\n]{0,30}scriptblocklogging|\\b(add|set)-mppreference\\b[^\\n]*(-exclusion|disable)",
+      "description": "Disabling PowerShell ScriptBlock logging / adding Defender exclusion"
+    },
+    {
+      "id": "locale-override",
+      "category": "locale",
+      "severity": "medium",
+      "pattern": "(?i)set-winuilanguageoverride|set-winuserlanguagelist|set-winsystemlocale|set-culture",
+      "description": "System locale/language manipulation (anti-attribution)"
+    }
+  ]
+}
