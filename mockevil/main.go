@@ -11,7 +11,7 @@ import (
 	"log"
 	"net/http"
 
-	"holone/internal/mockevil"
+	"github.com/vanndh/holone/internal/mockevil"
 )
 
 func main() {

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"holone/internal/inspect"
+	"github.com/vanndh/holone/internal/inspect"
 )
 
 // platformChecks runs the Windows-specific IOC probes from the awstore.cloud

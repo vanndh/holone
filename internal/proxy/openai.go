@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	"holone/internal/inspect"
+	"github.com/vanndh/holone/internal/inspect"
 )
 
 // openaiChunk is the subset of an OpenAI Chat Completions stream chunk we read.

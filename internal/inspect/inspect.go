@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	"holone/rules"
+	"github.com/vanndh/holone/rules"
 )
 
 // Severity ranks how dangerous a finding is.

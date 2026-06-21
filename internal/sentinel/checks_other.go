@@ -6,7 +6,7 @@ import (
 	"context"
 	"strings"
 
-	"holone/internal/inspect"
+	"github.com/vanndh/holone/internal/inspect"
 )
 
 // platformChecks runs best-effort POSIX (macOS/Linux) IOC probes. The headline

@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	"holone/internal/inspect"
+	"github.com/vanndh/holone/internal/inspect"
 )
 
 // anthropicEvent is the subset of the Anthropic streaming schema we inspect.
