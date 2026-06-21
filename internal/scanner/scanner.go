@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"holone/internal/inspect"
+	"github.com/vanndh/holone/internal/inspect"
 )
 
 // ProbeResult is the outcome of one request sent to the endpoint.

@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"holone/internal/inspect"
+	"github.com/vanndh/holone/internal/inspect"
 )
 
 // Status classifies a check result.

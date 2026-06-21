@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"holone/internal/inspect"
+	"github.com/vanndh/holone/internal/inspect"
 )
 
 // Mode controls how the proxy treats detected payloads.

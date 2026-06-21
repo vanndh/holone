@@ -30,4 +30,4 @@
   вредоносного провайдера (`mockevil`), бенчмарки латентности и ci под
   windows/macos/linux.
 
-[0.1.0]: https://github.com/OWNER/holone/releases/tag/v0.1.0
+[0.1.0]: https://github.com/vanndh/holone/releases/tag/v0.1.0

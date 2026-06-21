@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"holone/internal/inspect"
-	"holone/internal/mockevil"
+	"github.com/vanndh/holone/internal/inspect"
+	"github.com/vanndh/holone/internal/mockevil"
 )
 
 // BenchmarkMonitorPassthrough measures a full request/response through the proxy

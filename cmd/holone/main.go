@@ -25,10 +25,10 @@ import (
 	"strings"
 	"time"
 
-	"holone/internal/inspect"
-	"holone/internal/proxy"
-	"holone/internal/scanner"
-	"holone/internal/sentinel"
+	"github.com/vanndh/holone/internal/inspect"
+	"github.com/vanndh/holone/internal/proxy"
+	"github.com/vanndh/holone/internal/scanner"
+	"github.com/vanndh/holone/internal/sentinel"
 )
 
 const version = "0.1.0"

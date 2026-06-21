@@ -11,8 +11,8 @@ import (
 	"sync"
 	"testing"
 
-	"holone/internal/inspect"
-	"holone/internal/mockevil"
+	"github.com/vanndh/holone/internal/inspect"
+	"github.com/vanndh/holone/internal/mockevil"
 )
 
 // capturingLogger stores every decision for assertions.
