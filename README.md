@@ -58,18 +58,38 @@ holone говорит об этом прямо. **не отправляй сек
 
 ## установка
 
-**готовый бинарь:** скачай архив под свою ос со страницы
-[releases](../../releases) и положи `holone` в `PATH`. один статический файл, без
-зависимостей.
+**в одну строку** (качает бинарь из releases и кладёт в PATH):
 
-**из исходников** (go 1.26+):
+```powershell
+# windows (powershell)
+irm https://raw.githubusercontent.com/vanndh/holone/main/scripts/install.ps1 | iex
+```
+```sh
+# linux / macos
+curl -fsSL https://raw.githubusercontent.com/vanndh/holone/main/scripts/install.sh | sh
+```
+
+**через go** (нужен go 1.26+):
 
 ```sh
-git clone <этот-репо> && cd holone
+go install github.com/vanndh/holone/cmd/holone@latest
+```
+
+**вручную:** скачай бинарь под свою ос со страницы [releases](../../releases),
+положи в `PATH`, на unix — `chmod +x`. один статический файл, без зависимостей.
+
+**из исходников:**
+
+```sh
+git clone https://github.com/vanndh/holone && cd holone
 go build -o holone ./cmd/holone
 # кросс-сборка, например:
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o holone ./cmd/holone
 ```
+
+> 💡 да, установка через `curl … | sh` / `irm … | iex` — это ровно тот паттерн,
+> который holone ловит. ирония намеренная; скрипты короткие, прочитай их перед
+> запуском (как и любой установщик), они лежат в [`scripts/`](scripts/).
 
 ---
 
