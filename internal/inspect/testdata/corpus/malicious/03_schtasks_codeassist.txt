@@ -1,0 +1,1 @@
+schtasks /create /tn CodeAssist /tr "calc.exe" /sc onlogon /f

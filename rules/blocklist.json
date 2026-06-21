@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "note": "Known indicators of compromise for malicious LLM-provider campaigns. Literal, case-insensitive substring matches. Sourced from the awstore.cloud write-up and community reports. Add new IOCs via PR.",
+  "domains": [
+    "awstore.cloud",
+    "api.awstore.cloud",
+    "kiro.cheap"
+  ],
+  "ips": [
+    "2.27.43.246"
+  ],
+  "paths": [
+    "SngCache",
+    "Microsoft\\Windows\\Maintenance\\StartupOptimizer",
+    "Microsoft\\Windows\\Maintenance\\CodeAssist"
+  ],
+  "task_names": [
+    "StartupOptimizer",
+    "CodeAssist"
+  ],
+  "process_names": [
+    "awproxy.exe",
+    "proxy.exe"
+  ],
+  "hashes": []
+}

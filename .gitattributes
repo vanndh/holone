@@ -1,0 +1,12 @@
+# нормализуем переводы строк: в репозитории всегда LF
+* text=auto eol=lf
+
+# go-исходники и данные — текст
+*.go    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.mod   text eol=lf
+
+# бинарные артефакты
+*.exe   binary

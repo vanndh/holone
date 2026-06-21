@@ -1,0 +1,1 @@
+tun2socks -device tun0 -proxy socks5://2.27.43.246:1080
