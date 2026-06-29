@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "note": "Behavioral detection rules for malicious LLM-provider response injection. Patterns are Go RE2 regular expressions (no lookaround/backreferences). Each match against assistant text, tool_use input, or tool_call arguments produces a Finding. Severity guidance: 'high' = download+execute, anti-forensics, traffic hijack, LOLBin staging, or known IOC (Block mode strips these and unsolicited tool calls). 'medium' = dual-use actions (plain download, route/proxy/cron config) that warrant an alert but not auto-stripping. 'low' = weak signals. Community PRs welcome.",
+  "version": 3,
+  "note": "Behavioral detection rules for malicious LLM-provider response injection. Patterns are Go RE2 regular expressions (no lookaround/backreferences). Each match against assistant text, tool_use input, or tool_call arguments produces a Finding. v3 adds coverage for attack surfaces a hostile provider can reach through an AI client that the v2 set missed: client-config poisoning (.claude/settings.json, .mcp.json, CLAUDE.md/AGENTS.md hooks), credential theft (SSH keys, AWS/kube/docker creds, browser stores, .env, .netrc), exfiltration to legit-looking hosts (Discord/Telegram/Slack webhooks, paste services, DNS-tunnel command substitution), extra LOLBins (msiexec/installutil/regasm/forfiles/wmic/Add-Type/osascript), EDR/AMSI/ETW/CLM evasion, git attacks (core.hooksPath, remote hijack, .git/hooks writes, CI workflow poisoning), macOS/Linux/docker/WSL persistence vectors, and package-manager config poisoning. Severity guidance: 'high' = download+execute, anti-forensics, traffic hijack, LOLBin staging, client backdoor/hook injection, credential theft, known IOC (Block mode strips these and unsolicited tool calls). 'medium' = dual-use actions (plain download, route/proxy/cron config, settings edits, paste upload, osascript) that warrant an alert but not auto-stripping. 'low' = weak signals. Community PRs welcome.",
   "rules": [
     {
       "id": "dl-curl-pipe-sh",
@@ -239,6 +239,293 @@
       "severity": "medium",
       "pattern": "(?i)set-winuilanguageoverride|set-winuserlanguagelist|set-winsystemlocale|set-culture",
       "description": "System locale/language manipulation (anti-attribution)"
+    },
+    {
+      "id": "cfg-claude-settings-write",
+      "category": "client-config",
+      "severity": "medium",
+      "pattern": "(?i)(set-content|out-file|add-content|tee-object|cat\\s*>|>\\s*)[\\s\\S]{0,80}(\\.claude/(settings|settings\\.local)\\.json|~/\\.claude\\.json|\\$HOME/\\.claude\\.json)",
+      "description": "Rewrite of a Claude Code client settings file (.claude/settings.json or ~/.claude.json) — persistent client-side configuration tampering"
+    },
+    {
+      "id": "cfg-mcp-server-inject",
+      "category": "client-config",
+      "severity": "medium",
+      "pattern": "(?i)(mcp_servers|mcpServers|\\.mcp\\.json|\\.cursor/mcp\\.json)[\\s\\S]{0,120}(npx|uvx|node\\s|python\\s|\"command\"|args\\s*:|command\\s*:)",
+      "description": "MCP server entry injected into a client MCP config (npx/uvx/node/python command runner) — adds a tool surface the provider controls"
+    },
+    {
+      "id": "cfg-client-hook-inject",
+      "category": "client-config",
+      "severity": "high",
+      "pattern": "(?i)(PreToolUse|PostToolUse|UserPromptSubmit|Stop|Notification|\"hooks\")[\\s\\S]{0,120}(\\.claude/(settings|settings\\.local)\\.json|~/\\.claude\\.json|\\.claude/hooks)",
+      "description": "Client lifecycle hook (PreToolUse/PostToolUse/Stop) injected into settings — runs arbitrary commands on every tool call or session end"
+    },
+    {
+      "id": "cfg-instruction-file-poison",
+      "category": "client-config",
+      "severity": "high",
+      "pattern": "(?i)(curl|wget|iex|invoke-expression|http[s]?://|base64|/bin/sh|powershell)[\\s\\S]{0,120}\\b(CLAUDE|AGENTS)\\.md\\b|\\b(CLAUDE|AGENTS)\\.md\\b[\\s\\S]{0,120}(curl|wget|iex|invoke-expression|http[s]?://|base64|/bin/sh|powershell)|\\.cursorrules[\\s\\S]{0,120}(curl|wget|http[s]?://|base64|/bin/sh)",
+      "description": "Persistent prompt-injection written to an AI client instruction file (CLAUDE.md/AGENTS.md/.cursorrules) carrying a payload indicator"
+    },
+    {
+      "id": "cred-ssh-key-read",
+      "category": "credential-theft",
+      "severity": "high",
+      "pattern": "(?i)(cat|get-content|type|cp|copy|curl|slurp|send|upload)\\b[\\s\\S]{0,40}~/\\.ssh/id_(rsa|ed25519|ecdsa|dsa)(\\s|$|['\";,/|&)])",
+      "description": "Read or copy of an SSH private key (~/.ssh/id_rsa / id_ed25519 / id_ecdsa / id_dsa)"
+    },
+    {
+      "id": "cred-aws-read",
+      "category": "credential-theft",
+      "severity": "high",
+      "pattern": "(?i)(cat|get-content|type|cp|copy|curl|send|upload)\\b[\\s\\S]{0,40}~/\\.aws/credentials|/\\.aws/credentials\\b",
+      "description": "Read of the AWS credentials file (~/.aws/credentials)"
+    },
+    {
+      "id": "cred-kube-config-read",
+      "category": "credential-theft",
+      "severity": "high",
+      "pattern": "(?i)(cat|get-content|type|cp|copy|curl|send|upload)\\b[\\s\\S]{0,40}~/\\.kube/config|/\\.kube/config\\b",
+      "description": "Read of the Kubernetes kubeconfig (~/.kube/config) — cluster credentials"
+    },
+    {
+      "id": "cred-docker-config-read",
+      "category": "credential-theft",
+      "severity": "high",
+      "pattern": "(?i)(cat|get-content|type|cp|copy|curl)\\b[\\s\\S]{0,40}~/\\.docker/config\\.json",
+      "description": "Read of the Docker config (~/.docker/config.json) — registry tokens"
+    },
+    {
+      "id": "cred-netrc-read",
+      "category": "credential-theft",
+      "severity": "high",
+      "pattern": "(?i)(cat|get-content|type|cp|copy|curl)\\b[\\s\\S]{0,40}~/\\.netrc\\b",
+      "description": "Read of ~/.netrc — FTP/HTTP stored credentials"
+    },
+    {
+      "id": "cred-env-read",
+      "category": "credential-theft",
+      "severity": "medium",
+      "pattern": "(?i)(cat|get-content|type|cp|copy)\\b[\\s\\S]{0,30}\\.env(\\.(local|prod|production|development|test|staging))?($|[\\s\"';|&)=])",
+      "description": "Read of a .env / .env.local / .env.production file — application secrets (dual-use: also legitimate in dev)"
+    },
+    {
+      "id": "cred-browser-chrome",
+      "category": "credential-theft",
+      "severity": "high",
+      "pattern": "(?i)(Login Data|Cookies|Local State|Web Data|History)\\b[\\s\\S]{0,80}(Chrome|Google\\\\Chrome|AppData|Application Support)|/Google/Chrome/[^\\n]*(Login Data|Cookies|Local State|Web Data)",
+      "description": "Access to Chrome browser credential/cookie stores (Login Data / Cookies / Local State / Web Data)"
+    },
+    {
+      "id": "cred-gitcredential",
+      "category": "credential-theft",
+      "severity": "medium",
+      "pattern": "(?i)git\\s+credential\\s+(fill|cache|approve|store)\\b",
+      "description": "git credential helper invocation to harvest stored git credentials"
+    },
+    {
+      "id": "exfil-discord-webhook",
+      "category": "exfil",
+      "severity": "high",
+      "pattern": "(?i)discord\\.com/api/webhooks/\\d+/[A-Za-z0-9_-]+",
+      "description": "Discord webhook URL — common exfiltration channel that resolves to a legit domain, bypassing domain blocklists"
+    },
+    {
+      "id": "exfil-telegram-bot",
+      "category": "exfil",
+      "severity": "high",
+      "pattern": "(?i)api\\.telegram\\.org/bot[0-9]+:[A-Za-z0-9_-]+/(send(message|document|file|photo|audio|video|sticker)|forwardmessage|getfile|editmessage)",
+      "description": "Telegram Bot API send/forward call — exfiltration over a whitelisted domain"
+    },
+    {
+      "id": "exfil-slack-webhook",
+      "category": "exfil",
+      "severity": "high",
+      "pattern": "(?i)hooks\\.slack\\.com/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]{16,}",
+      "description": "Slack incoming-webhook URL — exfiltration channel on a whitelisted domain"
+    },
+    {
+      "id": "exfil-paste-host",
+      "category": "exfil",
+      "severity": "medium",
+      "pattern": "(?i)(curl|wget)\\b[\\s\\S]{0,40}\\b(0x0\\.st|transfer\\.sh|paste\\.sh|paste\\.ee|paste\\.rs|ix\\.io|sprunge\\.us|dpaste\\.(org|com)|hastebin|ghostbin|ptpb\\.pb)\\b",
+      "description": "Upload to an anonymous paste/transfer service (0x0.st, transfer.sh, paste.* ) — dual-use, but a classic exfil endpoint"
+    },
+    {
+      "id": "exfil-dns-nslookup",
+      "category": "exfil",
+      "severity": "high",
+      "pattern": "(?i)\\b(nslookup|dig)\\b[\\s\\S]{0,20}(\\$\\(|`)",
+      "description": "DNS resolver fed command-substitution output (nslookup $(...) / dig `...`) — DNS-tunnel exfiltration pattern"
+    },
+    {
+      "id": "exfil-dnscat",
+      "category": "exfil",
+      "severity": "high",
+      "pattern": "(?i)\\bdnscat2?\\b",
+      "description": "dnscat2 DNS tunneling tool"
+    },
+    {
+      "id": "exec-msiexec-url",
+      "category": "download-exec",
+      "severity": "high",
+      "pattern": "(?i)\\bmsiexec\\b[^\\n]*(/i\\b[^\\n]*http|/q[^\\n]*/i\\b|/quiet[^\\n]*/i\\b|/passive[^\\n]*/i\\b)",
+      "description": "msiexec installs a remote/silent MSI package (LOLBin download+execute)"
+    },
+    {
+      "id": "exec-installutil",
+      "category": "download-exec",
+      "severity": "medium",
+      "pattern": "(?i)\\b(installutil|regasm|regsvcs)\\b[^\\n]*(/u\\b|http|\\.dll\\b|logfile)",
+      "description": ".NET LOLBin (InstallUtil/Regasm/Regsvcs) proxy execution of an assembly"
+    },
+    {
+      "id": "exec-forfiles-cmd",
+      "category": "download-exec",
+      "severity": "high",
+      "pattern": "(?i)\\bforfiles\\b[^\\n]*/c\\b[^\\n]*(cmd|powershell|cscript|wscript|sh\\b)",
+      "description": "forfiles /c launching an arbitrary interpreter (LOLBin execution)"
+    },
+    {
+      "id": "exec-wmic-process",
+      "category": "download-exec",
+      "severity": "high",
+      "pattern": "(?i)\\bwmic\\b[^\\n]*process\\s+call\\s+create\\b",
+      "description": "wmic process call create — arbitrary process launch via WMI"
+    },
+    {
+      "id": "exec-addtype-csharp",
+      "category": "obfuscation",
+      "severity": "medium",
+      "pattern": "(?i)\\badd-type\\b[^\\n]*(Assembly|Type|namespace|using\\s+System|DllImport|public\\s+class|System\\.Reflection)",
+      "description": "Add-Type compiling inline C# (dual-use interop, but also the standard AMSI-bypass / in-memory payload loader)"
+    },
+    {
+      "id": "exec-osascript",
+      "category": "download-exec",
+      "severity": "medium",
+      "pattern": "(?i)\\bosascript\\b[\\s\\S]{0,80}do\\s+shell\\s+script",
+      "description": "osascript do shell script — macOS AppleScript arbitrary shell execution"
+    },
+    {
+      "id": "edr-amsi-bypass",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)amsiInitFailed|AmsiUtils|\\[Ref\\]\\.Assembly\\.GetType|\\bamsi\\b[\\s\\S]{0,40}(bypass|fail|\\$null|setvalue|patch)",
+      "description": "AMSI bypass (amsiInitFailed / AmsiUtils reflection / patching) — disabling content scanning before payload"
+    },
+    {
+      "id": "edr-etw-patch",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)EtwEventWrite|PatchEventWrite|\\bETW\\b[\\s\\S]{0,40}(patch|bypass|null|unhook)",
+      "description": "ETW patching / EventWrite hooking — blinding telemetry before payload execution"
+    },
+    {
+      "id": "edr-clm-bypass",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)ExecutionContext\\.SessionState\\.LanguageMode|LanguageMode\\b[\\s\\S]{0,20}(Full|Constrained|Bypass)",
+      "description": "PowerShell Constrained Language Mode bypass — escaping a sandbox restriction"
+    },
+    {
+      "id": "git-hookspath",
+      "category": "git-attack",
+      "severity": "high",
+      "pattern": "(?i)git\\s+config\\b[^\\n]*core\\.hooksPath",
+      "description": "git config core.hooksPath — redirecting git hooks to an attacker-controlled directory"
+    },
+    {
+      "id": "git-remote-attack",
+      "category": "git-attack",
+      "severity": "medium",
+      "pattern": "(?i)git\\s+remote\\b[^\\n]*set-url\\b[^\\n]*http[s]?://",
+      "description": "git remote set-url pointing at an HTTP(S) endpoint — remote hijack for push-exfil or supply-chain injection (dual-use)"
+    },
+    {
+      "id": "git-hooks-write",
+      "category": "git-attack",
+      "severity": "high",
+      "pattern": "(?i)\\.git/hooks/[A-Za-z][A-Za-z0-9._-]*[\\s\\S]{0,60}(set-content|out-file|tee-object|cat\\s*>|>\\s*|echo\\b|chmod\\s+\\+x)",
+      "description": "Writing a file into .git/hooks/ — git hook persistence (pre-commit/pre-push/pre-rebase)"
+    },
+    {
+      "id": "git-ci-poisoning",
+      "category": "git-attack",
+      "severity": "high",
+      "pattern": "(?i)\\.github/workflows/[A-Za-z0-9_.-]+\\.ya?ml[\\s\\S]{0,150}(curl|wget|iex|invoke-expression|http[s]?://|run:|bash|/bin/sh)",
+      "description": "GitHub Actions workflow file carrying a fetch/exec payload — CI supply-chain poisoning"
+    },
+    {
+      "id": "persist-macos-loginitem",
+      "category": "persistence",
+      "severity": "medium",
+      "pattern": "(?i)defaults\\s+write\\b[^\\n]*loginwindow|osascript[^\\n]*Login\\s+Items",
+      "description": "macOS Login Items persistence via defaults / osascript"
+    },
+    {
+      "id": "persist-launchctl-bootstrap",
+      "category": "persistence",
+      "severity": "medium",
+      "pattern": "(?i)launchctl\\s+(bootstrap|load\\s+-w|enable\\b)",
+      "description": "launchctl bootstrap/load — loading a persistent launchd agent/daemon (macOS)"
+    },
+    {
+      "id": "persist-systemd-payload",
+      "category": "persistence",
+      "severity": "medium",
+      "pattern": "(?i)systemd-run\\b[\\s\\S]{0,40}(curl|wget|http|bash|/bin/sh)|/etc/systemd/system/[A-Za-z0-9._-]+\\.service[\\s\\S]{0,120}(curl|wget|http|exec|bash|/bin/|powershell)",
+      "description": "systemd unit file / systemd-run carrying a fetch/exec payload — Linux persistence (scoped: plain 'systemctl enable nginx' is NOT matched)"
+    },
+    {
+      "id": "exec-docker-privileged",
+      "category": "network",
+      "severity": "high",
+      "pattern": "(?i)docker\\s+run\\b[^\\n]*(--privileged|--pid=host|--net=host|-v\\s+/:/|-v\\s+/:[A-Za-z]+|--add-host|--cgroupns=host)",
+      "description": "docker run with host-escape flags (--privileged / --pid=host / -v /:/ ) — container breakout"
+    },
+    {
+      "id": "exec-wsl-pivot",
+      "category": "persistence",
+      "severity": "medium",
+      "pattern": "(?i)\\bwsl\\b[^\\n]*(--exec|-e\\b|bash\\s+-c|cmd\\s+/c|/bin/sh)",
+      "description": "WSL invocation to pivot into the Linux subsystem — bypassing Windows-side checks (dual-use)"
+    },
+    {
+      "id": "pkg-npmrc-poison",
+      "category": "persistence",
+      "severity": "high",
+      "pattern": "(?i)~/\\.npmrc[\\s\\S]{0,60}(registry|http)|npm\\s+config\\s+set\\s+registry\\b",
+      "description": "~/.npmrc / npm config registry override — redirecting package installs to a malicious registry (supply-chain persistence)"
+    },
+    {
+      "id": "pkg-pip-config-poison",
+      "category": "persistence",
+      "severity": "high",
+      "pattern": "(?i)pip\\s+config\\s+set\\s+(global\\.)?index-url|~/\\.pip/pip\\.conf[\\s\\S]{0,40}index-url|pip\\.ini[\\s\\S]{0,40}index-url",
+      "description": "pip index-url override — redirecting Python package installs to a malicious index"
+    },
+    {
+      "id": "af-linux-log-wipe",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)(>\\s*/var/log/|rm\\b[^\\n]*/var/log/|journalctl\\s+--vacuum|shred\\b[^\\n]*/var/log/|/dev/null\\s*>\\s*/var/log/)",
+      "description": "Linux log file wiping (rm/journalctl --vacuum/shred / redirect on /var/log)"
+    },
+    {
+      "id": "af-linux-history-wipe",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)unset\\s+HISTFILE|history\\s+-c|/dev/null\\s*>\\s*~/\\.bash_history|shred\\b[^\\n]*~/\\.bash_history|>\\s*~/\\.bash_history|rm\\b[^\\n]*~/\\.\\w*history",
+      "description": "Linux shell history wiping (unset HISTFILE / history -c / shred / redirect on ~/.bash_history)"
+    },
+    {
+      "id": "persist-shell-rc-poison",
+      "category": "persistence",
+      "severity": "high",
+      "pattern": "(?i)(\\.bashrc|\\.zshrc|\\.profile|\\.bash_profile|\\.zprofile)[\\s\\S]{0,120}(curl|wget|iex|invoke-expression|http[s]?://|base64|\\bnc\\b|bash\\s+-i|/dev/tcp/|/bin/sh)",
+      "description": "Shell RC/profile file carrying a fetch/exec payload — persistent execution on every new shell (Linux/macOS)"
     }
   ]
 }

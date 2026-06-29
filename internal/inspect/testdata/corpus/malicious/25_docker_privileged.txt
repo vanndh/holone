@@ -1,0 +1,1 @@
+docker run --privileged --pid=host -v /:/host ubuntu chroot /host bash

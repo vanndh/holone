@@ -1,0 +1,1 @@
+systemctl status nginx && systemctl reload nginx

