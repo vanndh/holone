@@ -42,7 +42,7 @@ if ($userPath -notlike "*$dir*") {
 
 Write-Host ""
 Write-Host "  installed:" -ForegroundColor Green
-& $dest version
+& $dest version --no-update-check
 Write-Host ""
 Write-Host "  next:" -ForegroundColor Cyan
 Write-Host "    holone proxy --upstream https://your-provider"

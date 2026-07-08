@@ -7,6 +7,7 @@
 //	holone scan     <base-url> [--key KEY]
 //	holone audit
 //	holone sentinel [--interval 30s]
+//	holone dashboard [--listen 127.0.0.1:9090]
 //
 // Point your client's API base URL at the proxy and traffic is inspected on the
 // wire. See README for per-client setup.
@@ -25,35 +26,40 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vanndh/holone/internal/dashboard"
 	"github.com/vanndh/holone/internal/inspect"
 	"github.com/vanndh/holone/internal/proxy"
 	"github.com/vanndh/holone/internal/scanner"
 	"github.com/vanndh/holone/internal/sentinel"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
+	checkForUpdate(os.Args)
+	args := argsWithoutUpdateFlag(os.Args)
 	var err error
-	switch os.Args[1] {
+	switch args[1] {
 	case "proxy":
-		err = cmdProxy(os.Args[2:])
+		err = cmdProxy(args[2:])
 	case "scan":
-		err = cmdScan(os.Args[2:])
+		err = cmdScan(args[2:])
 	case "audit":
-		err = cmdAudit(os.Args[2:])
+		err = cmdAudit(args[2:])
 	case "sentinel":
-		err = cmdSentinel(os.Args[2:])
+		err = cmdSentinel(args[2:])
+	case "dashboard":
+		err = cmdDashboard(args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("holone %s\n", version)
 	case "help", "--help", "-h":
 		usage()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", args[1])
 		usage()
 		os.Exit(2)
 	}
@@ -71,6 +77,7 @@ USAGE:
   holone scan     <base-url> [--key <api-key>] [--model <name>] [--json]
   holone audit    [--json]
   holone sentinel [--interval 30s]
+  holone dashboard [--listen 127.0.0.1:9090]
   holone version
 
 QUICK START:
@@ -80,6 +87,7 @@ QUICK START:
 
 Monitor mode (default) never alters traffic and adds ~0 latency.
 Block mode strips malicious tool calls before they reach the client.
+Dashboard mode serves a web UI at http://127.0.0.1:9090 for management.
 `)
 }
 
@@ -150,10 +158,10 @@ func cmdScan(args []string) error {
 	key := fs.String("key", "", "API key (default: $ANTHROPIC_API_KEY)")
 	model := fs.String("model", "", "model name to request")
 	asJSON := fs.Bool("json", false, "emit JSON report")
-	fs.Parse(args)
+	fs.Parse(normalizeScanArgs(args))
 
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: holone scan <base-url> [--key KEY]")
+		return fmt.Errorf("usage: holone scan <base-url> [--key KEY] [--model NAME] [--json]")
 	}
 	apiKey := *key
 	if apiKey == "" {
@@ -162,10 +170,44 @@ func cmdScan(args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	res, err := scanner.Scan(ctx, scanner.Options{BaseURL: fs.Arg(0), APIKey: apiKey, Model: *model})
+
+	var progress scanner.ProgressFunc
+	if !*asJSON {
+		fmt.Printf("%sholone scan%s — %s\n", bold, reset, fs.Arg(0))
+		fmt.Printf("  resolving endpoint…  ")
+		progress = func(probe, status string, findings int, errMsg string) {
+			icon := green + "✓" + reset
+			if status == "fail" {
+				icon = red + "✗" + reset
+			} else if status == "error" {
+				icon = dim + "!" + reset
+			}
+			fmt.Printf("\r  %-22s %s  %s", probe, icon, status)
+			if errMsg != "" {
+				fmt.Printf("  %s(%s)%s", dim, truncateStr(errMsg, 40), reset)
+			}
+			if findings > 0 {
+				fmt.Printf("  %s%d finding(s)%s", yellow, findings, reset)
+			}
+			fmt.Println()
+		}
+	}
+	res, err := scanner.Scan(ctx, scanner.Options{
+		BaseURL:  fs.Arg(0),
+		APIKey:   apiKey,
+		Model:    *model,
+		Progress: progress,
+	})
 	if err != nil {
+		if !*asJSON {
+			fmt.Printf("\r  %serror:%s %v\n", red, reset, err)
+		}
 		return err
 	}
+	if !*asJSON {
+		fmt.Println()
+	}
+
 	if *asJSON {
 		b, _ := json.MarshalIndent(res, "", "  ")
 		fmt.Println(string(b))
@@ -224,6 +266,94 @@ func cmdSentinel(args []string) error {
 	})
 	fmt.Println("\nsentinel stopped.")
 	return nil
+}
+
+// --- dashboard -------------------------------------------------------------
+
+func cmdDashboard(args []string) error {
+	fs := flag.NewFlagSet("dashboard", flag.ExitOnError)
+	listen := fs.String("listen", "127.0.0.1:9090", "address to serve the dashboard on")
+	token := fs.String("token", "", "optional dashboard token (also accepts $HOLONE_DASHBOARD_TOKEN)")
+	logPath := fs.String("log", defaultLogPath(), "audit log file (jsonl); '-' for stdout")
+	fs.Parse(args)
+
+	if !dashboardListenIsLocal(*listen) {
+		return fmt.Errorf("dashboard --listen must be localhost or loopback")
+	}
+	if *token == "" {
+		*token = os.Getenv("HOLONE_DASHBOARD_TOKEN")
+	}
+
+	providers, err := dashboard.LoadProviders()
+	if err != nil {
+		return fmt.Errorf("load providers: %w", err)
+	}
+	activity := dashboard.NewActivityLog(1000)
+
+	eng, err := inspect.Default()
+	if err != nil {
+		return fmt.Errorf("load rules: %w", err)
+	}
+	logw, closeLog, err := openLog(*logPath)
+	if err != nil {
+		return err
+	}
+	defer closeLog()
+
+	scanFn := func(req dashboard.ScanRequest) (any, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		res, err := scanner.Scan(ctx, scanner.Options{
+			BaseURL: req.BaseURL,
+			APIKey:  req.APIKey,
+			Model:   req.Model,
+			Engine:  eng,
+		})
+		if err != nil {
+			return nil, err
+		}
+		activity.Add(dashboard.ActivityEntry{
+			Type:    "scan",
+			Verdict: res.Verdict,
+			Message: fmt.Sprintf("Scanned %s — %s (score %d)", res.Host, res.Verdict, res.RiskScore),
+		})
+		return res, nil
+	}
+
+	auditFn := func() (any, error) {
+		ctx := context.Background()
+		checks := sentinel.Audit(ctx)
+		infected := 0
+		for _, c := range checks {
+			if c.Status == sentinel.StatusInfected || c.Status == sentinel.StatusWarn || c.Status == sentinel.StatusError {
+				infected++
+			}
+		}
+		activity.Add(dashboard.ActivityEntry{
+			Type:    "audit",
+			Verdict: fmt.Sprintf("%d issues", infected),
+			Message: fmt.Sprintf("System audit: %d indicator(s) found", infected),
+		})
+		return checks, nil
+	}
+
+	srv := dashboard.New(dashboard.Config{
+		ListenAddr: *listen,
+		Token:      *token,
+		Providers:  providers,
+		Activity:   activity,
+		Engine:     eng,
+		ProxyLog:   proxy.NewLogger(logw),
+		ScanFn:     scanFn,
+		AuditFn:    auditFn,
+	})
+
+	fmt.Printf("%sholone dashboard%s — http://%s\n", bold, reset, *listen)
+	fmt.Printf("  managed proxy default: http://127.0.0.1:8787\n")
+	if *token != "" {
+		fmt.Printf("  dashboard token: required via X-Holone-Token or ?token=...\n")
+	}
+	return srv.ListenAndServe()
 }
 
 // --- shared helpers --------------------------------------------------------
@@ -293,44 +423,116 @@ func printDecision(d proxy.Decision) {
 }
 
 func printScan(r *scanner.Result) {
-	fmt.Printf("%sholone scan%s — %s\n\n", bold, reset, r.Endpoint)
-	fmt.Printf("  host:        %s (official: %v)\n", r.Host, r.Official)
+	fmt.Printf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	fmt.Printf("  %sEndpoint / Эндпоинт%s  %s\n", bold, reset, r.Endpoint)
+	fmt.Printf("  %sHost / Хост%s          %-20s  %sOfficial / Офиц.%s %v\n", dim, reset, r.Host, dim, reset, r.Official)
 	if len(r.ResolvedIPs) > 0 {
-		fmt.Printf("  resolves to: %s\n", strings.Join(r.ResolvedIPs, ", "))
+		fmt.Printf("  %sResolved / IP%s        %s\n", dim, reset, strings.Join(r.ResolvedIPs, ", "))
 	}
 	if r.TLS != nil {
-		fmt.Printf("  tls issuer:  %s (cert age %d days)\n", r.TLS.Issuer, r.TLS.AgeDays)
+		fmt.Printf("  %sTLS%s                  %s\n", dim, reset, r.TLS.Issuer)
+		fmt.Printf("  %sCert / Сертификат%s    age=%d days / возраст=%d дн., valid until / до %s\n", dim, reset, r.TLS.AgeDays, r.TLS.AgeDays, r.TLS.NotAfter)
 	}
-	for _, h := range r.BlocklistHits {
-		fmt.Printf("  %sIOC HIT:     %s%s\n", red, h, reset)
+	if len(r.BlocklistHits) > 0 {
+		fmt.Printf("\n  %sIOC HITS / СОВПАДЕНИЯ IOC%s\n", red+bold, reset)
+		for _, h := range r.BlocklistHits {
+			fmt.Printf("    %s● %s%s\n", red, h, reset)
+		}
 	}
-	fmt.Println("\n  probes:")
+
+	fmt.Printf("\n  %sSummary / Сводка%s\n", bold, reset)
+	fmt.Printf("    EN: %s\n", r.SummaryEN)
+	fmt.Printf("    RU: %s\n", r.SummaryRU)
+
+	fmt.Printf("\n  %sProbes / Пробы%s\n", bold, reset)
 	for _, p := range r.Probes {
-		line := fmt.Sprintf("    %-16s status=%d sawToolCall=%v findings=%d", p.Name, p.Status, p.SawToolCall, len(p.Findings))
+		label := fmt.Sprintf("  %-28s", p.Protocol+"/"+p.Name)
+		toolPolicy := "no tools / без tools"
+		if p.DeclaredTools {
+			toolPolicy = "tools declared / tools объявлены"
+		}
 		if p.Err != "" {
-			line += " err=" + p.Err
+			fmt.Printf("%s %sFAIL / ОШИБКА%s  %s  (%s)\n", label, dim, reset, toolPolicy, truncateStr(p.Err, 60))
+			continue
 		}
-		fmt.Println(line)
+		status := fmt.Sprintf("%sHTTP %d%s", dim, p.Status, reset)
+		dur := fmt.Sprintf("%s%4dms%s", dim, p.DurationMs, reset)
+		fmt.Printf("%s %s  %s  %s", label, status, dur, toolPolicy)
+		if p.SawToolCall {
+			fmt.Printf("  %sTOOL_CALL / ВЫЗОВ_TOOL%s", red+bold, reset)
+		}
+		fmt.Println()
+		if len(p.Findings) > 0 {
+			for _, f := range p.Findings {
+				sev := f.Severity
+				col := yellow
+				if sev == "high" {
+					col = red
+				}
+				desc := f.Description
+				if desc == "" {
+					desc = f.Category
+				}
+				fmt.Printf("    %s[%s]%s %-30s  %s%s%s\n", col, sev, reset, f.RuleID, dim, f.Match, reset)
+				fmt.Printf("      %s%s%s\n", dim, desc, reset)
+			}
+		}
 	}
-	if len(r.Notes) > 0 {
-		fmt.Println("\n  notes:")
+
+	if len(r.Notes) > 0 || len(r.NotesRU) > 0 {
+		fmt.Printf("\n  %sNotes / Заметки%s\n", bold, reset)
 		for _, n := range r.Notes {
-			fmt.Printf("    - %s\n", n)
+			fmt.Printf("    EN %s•%s %s\n", dim, reset, n)
+		}
+		for _, n := range r.NotesRU {
+			fmt.Printf("    RU %s•%s %s\n", dim, reset, n)
 		}
 	}
+
+	if len(r.RecommendationsEN) > 0 || len(r.RecommendationsRU) > 0 {
+		fmt.Printf("\n  %sRecommendations / Рекомендации%s\n", bold, reset)
+		for _, n := range r.RecommendationsEN {
+			fmt.Printf("    EN %s•%s %s\n", dim, reset, n)
+		}
+		for _, n := range r.RecommendationsRU {
+			fmt.Printf("    RU %s•%s %s\n", dim, reset, n)
+		}
+	}
+
 	col := green
+	verdict := r.Verdict
 	switch r.Verdict {
 	case "malicious", "high-risk":
-		col = red
+		col, verdict = red+bold, strings.ToUpper(r.Verdict)
 	case "suspicious":
-		col = yellow
+		col, verdict = yellow, strings.ToUpper(r.Verdict)
+	case "could-not-probe":
+		col, verdict = dim, strings.ToUpper(r.Verdict)
 	}
-	fmt.Printf("\n  risk score: %d  verdict: %s%s%s\n", r.RiskScore, col, r.Verdict, reset)
+	fmt.Printf("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	fmt.Printf("  %sScore / Риск%s  %d/∞  │  %sVerdict / Вердикт%s  %s%s%s\n", bold, reset, r.RiskScore, bold, reset, col, verdict, reset)
+	fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 }
 
 func officialHost(host string) bool {
 	h := strings.ToLower(host)
 	return h == "api.anthropic.com" || h == "api.openai.com"
+}
+
+func dashboardListenIsLocal(addr string) bool {
+	host, _, ok := strings.Cut(addr, ":")
+	if !ok || host == "" {
+		return false
+	}
+	host = strings.Trim(host, "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func truncateStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // --- tiny ANSI palette (disabled when NO_COLOR is set) ---------------------

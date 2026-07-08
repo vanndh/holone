@@ -4,7 +4,84 @@
 [keep a changelog](https://keepachangelog.com/), версионирование стремится
 следовать [semver](https://semver.org/).
 
-## [0.2.0] — unreleased
+## [0.3.0] — 2026-07-08
+
+### добавлено
+- **веб-дашборд** (`holone dashboard`) — локальный web UI на `127.0.0.1:9090`
+  для полного управления holone из браузера:
+  - **профили провайдеров** — добавление, удаление, редактирование
+    end-to-end-провайдеров с сохранением в `~/.holone/providers.json`.
+  - **мониторинг активности** — live-feed решений прокси (alert/block/clean),
+    сканов и аудитов, автообновление каждые 5 секунд.
+  - **скан провайдера** — запуск canary-проб прямо из браузера с визуальным
+    отображением verdict, risk score, findings и IOC hits.
+  - **аудит системы** — запуск OS-level проверок с табличным отображением
+    статусов.
+  - REST API (`/api/status`, `/api/providers`, `/api/activity`, `/api/scan`,
+    `/api/audit`) для программного доступа.
+  - single-page UI: тёмная тема, sidebar-навигация, адаптивные карточки.
+- **rules v4** — +30 правил (всего 105). новые категории и векторы:
+  - **thinking-block injection** — скрытые инструкции в `thinking` /
+    `redacted_thinking` полях стримингового ответа (обход пользовательской
+    видимости), аномально большой `signature` как стеганографический канал.
+  - **supply-chain атаки** — typosquatting-пакеты, postinstall-hook с payload,
+    dependency confusion (extra-index-url / scope registry).
+  - **новые LOLBins** — `hh.exe` (CHM download), `IEExec.exe` (.NET assembly),
+    `atbroker.exe`, `pcwrun.exe`, `cmd.exe` pipe-chain с recon-командами.
+  - **process injection / hollowing** — `CreateRemoteThread`,
+    `WriteProcessMemory`, `VirtualAllocEx`, `QueueUserAPC`, reflective DLL
+    loading (`ReflectiveLoader` / `ManualMap` / `RunPE`), shellcode staging
+    (`VirtualProtect` → `PAGE_EXECUTE_READWRITE`).
+  - **UAC bypass** — fodhelper / computerdefaults / eventvwr / compmgmtlauncher
+    + registry hijack (`ms-settings\Shell\Open\command`, `mscfile`).
+  - **Windows Defender tampering** — `Set-MpPreference -DisableRealtimeMonitoring`,
+    `MpCmdRun -removedefinitions`, `sc stop WinDefend`.
+  - **Windows Credential Manager** — `vaultcmd`, `cmdkey /list`, mimikatz/
+    sekurlsa/lsadump references.
+  - **cloud credential theft** — Azure (`~/.azure/`), GCP (`~/.config/gcloud/`,
+    `GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth print-access-token`).
+  - **additional exfil channels** — webhook.site / requestbin / ngrok / serveo,
+    CloudFront C2, pastebin upload, direct SMTP (`Send-MailMessage`),
+    cloud storage upload (`aws s3 cp`, `gsutil cp`, `rclone copy`).
+  - **hidden file attributes** — `attrib +h+s`, `Set-ItemProperty Attributes
+    Hidden`, `chflags hidden`.
+  - **NTFS ADS** — alternate data stream manipulation (`:$DATA`, `type > file:stream`).
+  - **registry persistence** — `RunOnceEx`, `RunServices`, `AppInit_DLLs`,
+    `IFEO`, `Winlogon\Shell`, `BootExecute`, и другие альтернативные ключи.
+  - **kernel driver loading** — `sc.exe create type=kernel`, `New-Service
+    KernelDriver`.
+  - **container escape** — `nsenter --target 1 --mount`, `--cap-add=SYS_ADMIN`,
+    `--security-opt apparmor=unconfined`.
+  - **LD_PRELOAD persistence** — `/etc/ld.so.preload` manipulation (Linux).
+- **4 новых mockevil-профиля** (`evil-supply` / `evil-inject` / `evil-uac` /
+  `evil-def`) для e2e покрытия новых векторов.
+- **сканер: 4 пробы вместо 2** — добавлены tooled-probes (с объявленными
+  инструментами) для обоих протоколов; пробы выполняются concurrently.
+- **сканер: progress callback** — live-отображение статуса каждой пробы.
+- **сканер: duration tracking** — время выполнения каждой пробы в отчёте.
+- **сканер: bilingual report** — summary / notes / recommendations доступны
+  на английском и русском в JSON, CLI и dashboard.
+- **update-check** — проверка GitHub Releases при запуске с кэшем на 12 часов,
+  `--no-update-check` и `HOLONE_NO_UPDATE_CHECK=1` для отключения.
+- **+27 тест-кейсов** на новые правила (high + medium severity), тесты
+  дашборда (CRUD providers, activity log, REST API, RU/EN scan render).
+
+### изменено
+- `rules.json`: version 3 → 4, note обновлён с описанием новых категорий.
+- `scanner.go`: полностью переписан — concurrent probe execution, 4 пробы,
+  progress callback, duration tracking, улучшенный scoring.
+- CLI `scan` output: визуальный редизайн — box-drawing границы, цветные
+  badges, детальное отображение findings с severity и match, bilingual summary
+  и рекомендации.
+- Dashboard scan view: локализует summary / notes / recommendations по выбранному
+  языку, показывает срок TLS-сертификата и детали проб.
+- `main.go`: version 0.2.0 → 0.3.0, добавлена `dashboard` subcommand.
+
+### не изменилось
+- ioc-блоклист — без новых верифицированных индикаторов.
+- прокси-движок (inspect/stream/block) — без изменений в hot path.
+
+## [0.2.0] — 2026-06-21
 
 расширение детекта: покрытие attack surfaces, которые вредоносный провайдер
 достигает через ai-клиент, но v0.1.0 пропускал.
@@ -79,6 +156,6 @@
   вредоносного провайдера (`mockevil`), бенчмарки латентности и ci под
   windows/macos/linux.
 
+[0.3.0]: https://github.com/vanndh/holone/releases/tag/v0.3.0
 [0.2.0]: https://github.com/vanndh/holone/releases/tag/v0.2.0
-
 [0.1.0]: https://github.com/vanndh/holone/releases/tag/v0.1.0

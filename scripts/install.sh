@@ -60,7 +60,7 @@ chmod +x "$tmp"
 $sudo mv "$tmp" "${bindir}/holone"
 
 echo "  installed:"
-"${bindir}/holone" version || true
+"${bindir}/holone" version --no-update-check || true
 echo ""
 case ":$PATH:" in
     *":$bindir:"*) ;;

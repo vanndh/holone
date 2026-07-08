@@ -1,6 +1,6 @@
 {
-  "version": 3,
-  "note": "Behavioral detection rules for malicious LLM-provider response injection. Patterns are Go RE2 regular expressions (no lookaround/backreferences). Each match against assistant text, tool_use input, or tool_call arguments produces a Finding. v3 adds coverage for attack surfaces a hostile provider can reach through an AI client that the v2 set missed: client-config poisoning (.claude/settings.json, .mcp.json, CLAUDE.md/AGENTS.md hooks), credential theft (SSH keys, AWS/kube/docker creds, browser stores, .env, .netrc), exfiltration to legit-looking hosts (Discord/Telegram/Slack webhooks, paste services, DNS-tunnel command substitution), extra LOLBins (msiexec/installutil/regasm/forfiles/wmic/Add-Type/osascript), EDR/AMSI/ETW/CLM evasion, git attacks (core.hooksPath, remote hijack, .git/hooks writes, CI workflow poisoning), macOS/Linux/docker/WSL persistence vectors, and package-manager config poisoning. Severity guidance: 'high' = download+execute, anti-forensics, traffic hijack, LOLBin staging, client backdoor/hook injection, credential theft, known IOC (Block mode strips these and unsolicited tool calls). 'medium' = dual-use actions (plain download, route/proxy/cron config, settings edits, paste upload, osascript) that warrant an alert but not auto-stripping. 'low' = weak signals. Community PRs welcome.",
+  "version": 4,
+  "note": "Behavioral detection rules for malicious LLM-provider response injection. Patterns are Go RE2 regular expressions (no lookaround/backreferences). Each match against assistant text, tool_use input, or tool_call arguments produces a Finding. v4 adds: thinking-block injection detection (hidden instructions in extended thinking / signature fields), supply-chain attack vectors (typosquatting, dependency confusion, postinstall hooks), additional LOLBins (hh.exe, IEExec, IE4uInit, atbroker, pcwrun, cmd.exe pipe chains), hidden file/attribute manipulation, registry persistence beyond Run keys, kernel driver loading, cloud credential theft (Azure, GCP, Azure CLI, gcloud), additional exfil channels (Webhook.site, RequestBin, ngrok, cloudfront, pastebin), process injection/hollowing patterns, UAC bypass, and Windows Defender tampering. Severity guidance: 'high' = download+execute, anti-forensics, traffic hijack, LOLBin staging, client backdoor/hook injection, credential theft, known IOC, process injection, UAC bypass, supply-chain poisoning. 'medium' = dual-use actions (plain download, route/proxy/cron config, settings edits, paste upload, osascript) that warrant an alert but not auto-stripping. 'low' = weak signals. Community PRs welcome.",
   "rules": [
     {
       "id": "dl-curl-pipe-sh",
@@ -526,6 +526,216 @@
       "severity": "high",
       "pattern": "(?i)(\\.bashrc|\\.zshrc|\\.profile|\\.bash_profile|\\.zprofile)[\\s\\S]{0,120}(curl|wget|iex|invoke-expression|http[s]?://|base64|\\bnc\\b|bash\\s+-i|/dev/tcp/|/bin/sh)",
       "description": "Shell RC/profile file carrying a fetch/exec payload — persistent execution on every new shell (Linux/macOS)"
+    },
+    {
+      "id": "cfg-thinking-inject",
+      "category": "client-config",
+      "severity": "high",
+      "pattern": "(?i)\"thinking\"[\\s\\S]{0,160}(curl|wget|iex|invoke-expression|schtasks|powershell|cmd\\.exe|\\|\\s*sh\\b|downloaded|executed|/bin/bash|npx|uvx)",
+      "description": "Hidden instruction embedded in an LLM thinking/redacted_thinking block — bypasses user visibility"
+    },
+    {
+      "id": "cfg-thinking-signature",
+      "category": "client-config",
+      "severity": "medium",
+      "pattern": "(?i)\"signature\"\\s*:\\s*\"[^\"]{200,}",
+      "description": "Abnormally large signature field in streaming response — potential steganographic payload channel"
+    },
+    {
+      "id": "supply-typosquat-pkg",
+      "category": "supply-chain",
+      "severity": "high",
+      "pattern": "(?i)\\b(npm\\s+install|pip\\s+install|pip3\\s+install|gem\\s+install|cargo\\s+install|go\\s+install)\\b[\\s\\S]{0,40}(https?://|[A-Za-z]+-[A-Za-z]+-[A-Za-z]+|evil|backdoor|stealth|hidden|trojan|inject)",
+      "description": "Package install from a suspicious source or with typosquatting-like compound name — supply-chain injection"
+    },
+    {
+      "id": "supply-postinstall-hook",
+      "category": "supply-chain",
+      "severity": "high",
+      "pattern": "(?i)\"postinstall\"\\s*:\\s*\"[^\"]*(curl|wget|nc\\s|nslookup|base64|\\$\\()",
+      "description": "npm package.json postinstall script with a fetch/exec/exfil payload — runs on install without user action"
+    },
+    {
+      "id": "supply-dependency-confusion",
+      "category": "supply-chain",
+      "severity": "high",
+      "pattern": "(?i)(npm\\s+config\\s+set\\s+@[a-z]+:registry|pip\\s+config\\s+set\\s+extra-index-url|\\bregistry\\b[\\s\\S]{0,40}(evil|backdoor|steal|leak|malware|inject))",
+      "description": "Package manager extra-index/scope registry pointing at a suspicious host — dependency confusion attack"
+    },
+    {
+      "id": "exec-hh-exe",
+      "category": "download-exec",
+      "severity": "high",
+      "pattern": "(?i)\\bhh\\.exe\\b[^\\n]*\\.(chm|ms-its|http)",
+      "description": "hh.exe downloading/opening a remote CHM — HTML Help LOLBin"
+    },
+    {
+      "id": "exec-ieexec",
+      "category": "download-exec",
+      "severity": "high",
+      "pattern": "(?i)\\b(IEExec|IEEXEC)\\.exe\\b[^\\n]*http",
+      "description": "IEExec loading a remote assembly — .NET LOLBin download+execute"
+    },
+    {
+      "id": "exec-atbroker",
+      "category": "download-exec",
+      "severity": "medium",
+      "pattern": "(?i)\\batbroker\\.exe\\b",
+      "description": "atbroker.exe — AT Broker accessibility-helper LOLBin (often used for UAC bypass)"
+    },
+    {
+      "id": "exec-pcwrun",
+      "category": "download-exec",
+      "severity": "medium",
+      "pattern": "(?i)\\bpcwrun\\.exe\\b",
+      "description": "pcwrun.exe — Program Compatibility Wizard runner LOLBin"
+    },
+    {
+      "id": "exec-cmd-pipe-chain",
+      "category": "download-exec",
+      "severity": "medium",
+      "pattern": "(?i)\\bcmd\\.exe\\b[^\\n]{0,60}/c\\b[^\\n]{0,60}\\|\\|?[^\\n]{0,60}\\b(curl|wget|powershell|net\\s+user|whoami|ipconfig|systeminfo|reg\\s+add)",
+      "description": "cmd.exe pipe chain with staging/recon commands — multi-stage LOLBin chain"
+    },
+    {
+      "id": "fs-hidden-attribute",
+      "category": "anti-forensics",
+      "severity": "medium",
+      "pattern": "(?i)\\battrib(\\.exe)?\\s*\\+[hsr]\\b|\\bset-itemproperty\\b[\\s\\S]{0,60}\\battributes\\b[\\s\\S]{0,40}\\bhidden\\b|\\bchflags\\b[^\\n]*\\bhidden\\b",
+      "description": "Setting hidden/system file attributes — stealth/anti-forensics"
+    },
+    {
+      "id": "fs-alternate-data-stream",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)\\bads\\b|alternate\\s*data\\s*stream|:\\$data\\b|\\btype\\b[^\\n]*>\\s*[^\\n]*:",
+      "description": "NTFS Alternate Data Stream manipulation — hiding payloads in ADS"
+    },
+    {
+      "id": "persist-reg-runonceex",
+      "category": "persistence",
+      "severity": "medium",
+      "pattern": "(?i)\\b(RunOnceEx|RunServices|RunServicesOnce|AppInit_DLLs|AppCertDlls|IFEO|Image\\s+File\\s+Execution\\s+Options|Active\\s+Setup|Installed\\s+Components|Winlogon\\\\Shell|Winlogon\\\\Userinit|Winlogon\\\\Notify|BootExecute|Session\\s+Manager\\\\PendingFileRenameOperations)",
+      "description": "Alternative registry persistence keys beyond standard Run/RunOnce"
+    },
+    {
+      "id": "exec-kernel-driver",
+      "category": "persistence",
+      "severity": "high",
+      "pattern": "(?i)\\bsc\\.exe?\\s+create\\b[^\\n]*\\btype=\\s*kernel\\b|\\bNew-Service\\b[\\s\\S]{0,40}KernelDriver|\\bDriverStore|\\\\.sys\\b[\\s\\S]{0,40}\\bsc\\.exe?\\s+start\\b",
+      "description": "Kernel driver loading (sc.exe type=kernel / New-Service KernelDriver) — ring-0 persistence"
+    },
+    {
+      "id": "cred-azure",
+      "category": "credential-theft",
+      "severity": "high",
+      "pattern": "(?i)(cat|get-content|type|cp|copy|curl|slurp|send|upload)\\b[\\s\\S]{0,40}(~/[.]azure/|az\\s+login[^\\n]*-p|C:\\\\Users\\\\[^\\\\]+\\\\[.]azure\\\\)",
+      "description": "Read of Azure credentials (~/.azure/ directory or az login with password)"
+    },
+    {
+      "id": "cred-gcp",
+      "category": "credential-theft",
+      "severity": "high",
+      "pattern": "(?i)(cat|get-content|type|cp|copy|curl|slurp|send|upload)\\b[\\s\\S]{0,40}(~/\\.config/gcloud/|GOOGLE_APPLICATION_CREDENTIALS|gcloud\\s+auth\\s+print-access-token)",
+      "description": "Read of GCP credentials (~/.config/gcloud/ or gcloud token extraction)"
+    },
+    {
+      "id": "exfil-webhook-site",
+      "category": "exfil",
+      "severity": "medium",
+      "pattern": "(?i)\\b(webhook\\.site|requestbin|requestcatcher|pipedream|beeceptor|mockapi|ngrok|localtunnel\\.me|pagekite|serveo\\.net|dataplicity|youshallnotpass|pythonanywhere\\.com)\\b",
+      "description": "Request to an ephemeral webhook/request-capture service — common exfil target"
+    },
+    {
+      "id": "exfil-cloudfront-c2",
+      "category": "exfil",
+      "severity": "medium",
+      "pattern": "(?i)\\bcloudfront\\.net\\b[\\s\\S]{0,40}(dns|exfil|tunnel|beacon|checkin|register|upload|send|report)",
+      "description": "CloudFront distribution with exfil/beacon-style query — C2 over CDN"
+    },
+    {
+      "id": "exfil-pastebin-upload",
+      "category": "exfil",
+      "severity": "medium",
+      "pattern": "(?i)(curl|wget)\\b[\\s\\S]{0,40}\\b(pastebin\\.com|paste\\.(ee|rs|sh)|iv\\.paste|justpaste\\.it|rentry\\.co|codeshare\\.io|dpaste)\\b",
+      "description": "Upload to a pastebin-style service — data exfiltration (dual-use)"
+    },
+    {
+      "id": "inj-process-hollowing",
+      "category": "obfuscation",
+      "severity": "high",
+      "pattern": "(?i)(CreateRemoteThread|WriteProcessMemory|VirtualAllocEx|NtCreateThreadEx|QueueUserAPC|SetThreadContext|ZwUnmapViewOfSection|PROCESS_CREATE_THREAD|PROCESS_VM_WRITE|PROCESS_VM_OPERATION)",
+      "description": "Process injection / hollowing API calls (CreateRemoteThread / WriteProcessMemory / QueueUserAPC)"
+    },
+    {
+      "id": "inj-reflective-load",
+      "category": "obfuscation",
+      "severity": "high",
+      "pattern": "(?i)(ReflectiveLoader|ManualMap|MemoryModule|RunPE|PE\\s+Injection)",
+      "description": "Reflective DLL loading or manual map / RunPE — fileless in-memory loading"
+    },
+    {
+      "id": "inj-shellcode-pattern",
+      "category": "obfuscation",
+      "severity": "high",
+      "pattern": "(?i)(VirtualProtect\\b[\\s\\S]{0,60}\\b(PAGE_EXECUTE_READWRITE|0x40)\\b|\\bWriteProcessMemory\\b[\\s\\S]{0,60}\\bCreateRemoteThread\\b|\\bGetDelegateForFunctionPointer\\b)",
+      "description": "Memory-protection flip followed by executable injection — shellcode staging pattern"
+    },
+    {
+      "id": "uac-bypass-fodhelper",
+      "category": "persistence",
+      "severity": "high",
+      "pattern": "(?i)(fodhelper|computerdefaults|sdclt|eventvwr|compmgmtlauncher|slui|wuauclt|DiskCleanup)[\\s\\S]{0,200}(bypass|elevat|HKCU|registry|CurVer|DelegateExecute|autoelevate|ms-settings|New-Item|reg\\s+add|Set-Item|Start-Process)|(bypass|HKCU|DelegateExecute|ms-settings|Shell\\\\\\\\Open\\\\\\\\command)[\\s\\S]{0,200}(fodhelper|computerdefaults|sdclt|eventvwr|compmgmtlauncher)",
+      "description": "UAC bypass via trusted binary (fodhelper/computerdefaults/eventvwr) + registry hijack"
+    },
+    {
+      "id": "defender-disable-realtime",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)Set-MpPreference\\s+(-DisableRealtimeMonitoring|-DisableBehaviorMonitoring|-DisableBlockAtFirstSeen|-DisableIOAVProtection|-DisableScriptScanning)\\s+\\$?true",
+      "description": "Disabling Windows Defender real-time monitoring / behavior / script scanning"
+    },
+    {
+      "id": "defender-remove-definitions",
+      "category": "anti-forensics",
+      "severity": "high",
+      "pattern": "(?i)(Remove-MpThreat|\"C:\\\\Program\\s+Files\\\\Windows\\s+Defender\\\\MpCmdRun\"\\s+-removedefinitions|windefend.*stop|sc\\.exe?\\s+stop\\s+WinDefend)",
+      "description": "Removing/stopping Windows Defender definitions — blinding AV before payload"
+    },
+    {
+      "id": "cred-win-credential-manager",
+      "category": "credential-theft",
+      "severity": "high",
+      "pattern": "(?i)(vaultcmd\\b|CredEnumerate|CredRead|\\[Windows\\.Security\\.Credentials\\b|PasswordVault|\\/list\\s+Windows\\s+Vault|cmdkey\\s+/list|mimikatz|sekurlsa|lsadump)",
+      "description": "Windows Credential Manager / vault access or mimikatz-style credential dump"
+    },
+    {
+      "id": "exfil-smtp-direct",
+      "category": "exfil",
+      "severity": "medium",
+      "pattern": "(?i)(send-mailmessage|net\\.mail\\.smtpclient|ssmtp|sendemail|mutt\\s+-s|mail\\s+-s)\\b[\\s\\S]{0,80}(@|password|credential|secret|attach|body)",
+      "description": "Direct SMTP email exfiltration (Send-MailMessage / SmtpClient / mutt / mail)"
+    },
+    {
+      "id": "exfil-file-upload-cloud",
+      "category": "exfil",
+      "severity": "medium",
+      "pattern": "(?i)(s3\\s+cp|aws\\s+s3\\s+(cp|sync)|azcopy\\s+copy|gsutil\\s+cp|rclone\\s+copy|megatools|onedrive\\s+upload|dropbox_uploader)(\\s|\\n)+[^\\n]*(credential|secret|ssh|kube|config|\\\\.env|\\\\.aws|\\\\.ssh|/etc/|passwd)",
+      "description": "Uploading credential files to cloud storage (s3/azcopy/gsutil/rclone/mega/dropbox)"
+    },
+    {
+      "id": "docker-escape-nsenter",
+      "category": "network",
+      "severity": "high",
+      "pattern": "(?i)nsenter\\s+--mount|nsenter\\s+--target\\s+1|nsenter\\s+--all.*\\/bin\\/(ba)?sh|unshare\\s+-[rRm]|--cap-add=SYS_ADMIN|--cap-add=SYS_PTRACE|--security-opt\\s+apparmor=unconfined|--security-opt\\s+seccomp=unconfined",
+      "description": "Container escape via nsenter/unshare or disabling security protections (SYS_ADMIN / apparmor=unconfined)"
+    },
+    {
+      "id": "exec-linux-ld-preload",
+      "category": "persistence",
+      "severity": "high",
+      "pattern": "(?i)(LD_PRELOAD|ld\\.so\\.preload|\\/etc\\/ld\\.so\\.preload|\\/etc\\/ld\\.so\\.pre\\.d\\/|\\.so\\b[\\s\\S]{0,60}\\bchmod\\s+\\+x|\\bldd\\b[\\s\\S]{0,40}(hook|inject|evil))",
+      "description": "LD_PRELOAD / ld.so.preload manipulation — library injection persistence (Linux)"
     }
   ]
 }

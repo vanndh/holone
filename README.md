@@ -9,6 +9,8 @@
 [![platforms](https://img.shields.io/badge/platforms-windows%20%7C%20macos%20%7C%20linux-555)]()
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
 
+**связь:** [Telegram @vanndh](https://t.me/vanndh) · Discord `vanndh`
+
 </div>
 
 ---
@@ -156,6 +158,36 @@ holone proxy --upstream <url-провайдера> [--listen 127.0.0.1:8787] [--
 флаги: `--log <файл|->` (jsonl-лог, по умолчанию `~/.holone/holone.log`),
 `--rules <файл>` / `--blocklist <файл>` — заменить встроенные правила.
 
+### `holone dashboard` — центр управления
+
+```sh
+holone dashboard
+# открой http://127.0.0.1:9090
+```
+
+дашборд — безопасный локальный центр управления holone:
+
+- хранит профили провайдеров в `~/.holone/providers.json`;
+- запускает и останавливает локальный proxy на `127.0.0.1:8787`;
+- переключает активный профиль без ручного перезапуска proxy;
+- показывает live-активность: clean / alert / blocked / scan / audit;
+- отдаёт каталог правил через `/api/rules`: `id`, категория, severity, pattern,
+  описание на английском и русском;
+- запускает `scan` и `audit` из UI.
+
+безопасность дашборда:
+
+- по умолчанию слушает только `127.0.0.1:9090`;
+- backend отклоняет не-loopback запросы;
+- управляемый proxy можно bind-ить только на localhost/loopback;
+- API-ключи можно передать для разового scan, но профили их не сохраняют и API
+  никогда не возвращает секреты;
+- при необходимости включи токен: `HOLONE_DASHBOARD_TOKEN=... holone dashboard`
+  или `holone dashboard --token ...`.
+
+обычный запуск `holone proxy ...` остаётся полностью поддержанным для headless / cli
+сценариев.
+
 ### `holone scan` — canary-проба провайдера
 
 ```sh
@@ -222,7 +254,8 @@ holone sentinel --interval 30s
 ## структура проекта
 
 ```
-cmd/holone            cli (proxy | scan | audit | sentinel)
+cmd/holone            cli (proxy | scan | audit | sentinel | dashboard)
+internal/dashboard    локальный backend/API центра управления
 internal/proxy        инспектирующий реверс-прокси (anthropic + openai sse)
 internal/inspect      движок детекта (регэкспы + ioc)
 internal/scanner      canary-сканер эндпоинта

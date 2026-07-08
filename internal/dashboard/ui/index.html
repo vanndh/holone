@@ -1,0 +1,890 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>holone — dashboard</title>
+<style>
+:root {
+  --bg: #0a0b0d;
+  --surface: #141519;
+  --surface2: #1a1c22;
+  --surface3: #22252c;
+  --border: #2a2d35;
+  --border-light: #353942;
+  --text: #dfe2e8;
+  --text-bright: #f5f6f8;
+  --dim: #7c828c;
+  --accent: #5b9fff;
+  --accent-dim: #3a7ae0;
+  --green: #4ec9b0;
+  --green-dim: #2d8a76;
+  --red: #f06d75;
+  --red-dim: #c04850;
+  --yellow: #e5c07b;
+  --yellow-dim: #b89650;
+  --radius: 6px;
+  --radius-lg: 10px;
+  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --transition: 150ms cubic-bezier(0.4,0,0.2,1);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: var(--sans); background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+.app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+
+/* --- Sidebar --- */
+.sidebar {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+.logo {
+  padding: 22px 24px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.logo-title { font-size: 18px; font-weight: 700; color: var(--text-bright); letter-spacing: -0.3px; }
+.logo-sub { font-size: 11px; color: var(--dim); margin-top: 2px; font-family: var(--mono); }
+.nav { padding: 8px 0; flex: 1; overflow-y: auto; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 24px;
+  cursor: pointer;
+  color: var(--dim);
+  font-size: 13px; font-weight: 500;
+  border-left: 2px solid transparent;
+  transition: all var(--transition);
+  user-select: none;
+}
+.nav-item:hover { color: var(--text); background: var(--surface2); }
+.nav-item.active { color: var(--accent); border-left-color: var(--accent); background: var(--surface2); }
+.nav-icon {
+  width: 16px; height: 16px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.sidebar-footer {
+  padding: 12px 24px;
+  border-top: 1px solid var(--border);
+  font-size: 11px; color: var(--dim);
+}
+.lang-toggle {
+  display: flex; gap: 0;
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+.lang-btn {
+  flex: 1; padding: 5px 10px;
+  background: transparent; border: none;
+  color: var(--dim); cursor: pointer;
+  font-size: 11px; font-weight: 600; font-family: var(--sans);
+  transition: all var(--transition);
+}
+.lang-btn.active { background: var(--accent); color: #fff; }
+.lang-btn:hover:not(.active) { color: var(--text); background: var(--surface2); }
+
+/* --- Main --- */
+.main { padding: 28px 36px; max-width: 1280px; overflow-y: auto; }
+.view { display: none; }
+.view.active { display: block; animation: fadeIn 200ms ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+h2 { font-size: 20px; font-weight: 600; color: var(--text-bright); margin-bottom: 20px; letter-spacing: -0.3px; }
+h3 { font-size: 14px; font-weight: 600; color: var(--dim); margin: 24px 0 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+/* --- Status cards --- */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px,1fr)); gap: 12px; margin-bottom: 28px; }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+  transition: border-color var(--transition);
+}
+.card:hover { border-color: var(--border-light); }
+.card .label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+.card .value { font-size: 26px; font-weight: 700; margin-top: 6px; color: var(--text-bright); font-variant-numeric: tabular-nums; }
+.card .sub { font-size: 12px; color: var(--dim); margin-top: 2px; word-break: break-all; }
+.card.ok .value { color: var(--green); }
+.card.alert .value { color: var(--red); }
+.card.warn .value { color: var(--yellow); }
+
+/* --- Status dot --- */
+.dot {
+  display: inline-block; width: 8px; height: 8px;
+  border-radius: 50%; margin-right: 6px; vertical-align: middle;
+}
+.dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.dot.off { background: var(--red); }
+
+/* --- Table --- */
+.table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--border); font-size: 13px; }
+th { color: var(--dim); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; background: var(--surface2); }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: var(--surface2); }
+.td-mono { font-family: var(--mono); font-size: 12px; }
+
+/* --- Buttons --- */
+.btn {
+  background: var(--accent); color: #fff; border: none;
+  padding: 8px 18px; border-radius: var(--radius);
+  cursor: pointer; font-size: 13px; font-weight: 600; font-family: var(--sans);
+  transition: all var(--transition); white-space: nowrap;
+}
+.btn:hover { background: var(--accent-dim); }
+.btn:active { transform: scale(0.97); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn.danger { background: var(--red-dim); }
+.btn.danger:hover { background: var(--red); }
+.btn.secondary { background: var(--surface3); border: 1px solid var(--border-light); color: var(--text); }
+.btn.secondary:hover { background: var(--border); border-color: var(--dim); }
+.btn.small { padding: 4px 12px; font-size: 12px; }
+
+/* --- Forms --- */
+input, select {
+  background: var(--surface2); border: 1px solid var(--border-light);
+  color: var(--text); padding: 9px 14px; border-radius: var(--radius);
+  font-size: 13px; font-family: var(--sans); width: 100%;
+  transition: border-color var(--transition);
+}
+input:focus { outline: none; border-color: var(--accent); }
+input::placeholder { color: var(--dim); }
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 5px; font-weight: 500; }
+.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.form-row-3 { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; }
+
+/* --- Badges --- */
+.badge {
+  display: inline-block; padding: 2px 9px; border-radius: 3px;
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px;
+}
+.badge.green { background: rgba(78,201,176,.12); color: var(--green); }
+.badge.red { background: rgba(240,109,117,.12); color: var(--red); }
+.badge.yellow { background: rgba(229,192,123,.12); color: var(--yellow); }
+.badge.dim { background: var(--surface3); color: var(--dim); }
+.badge.accent { background: rgba(91,159,255,.12); color: var(--accent); }
+
+/* --- Activity feed --- */
+.feed { display: flex; flex-direction: column; gap: 4px; }
+.entry {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 16px;
+  display: flex; align-items: center; gap: 14px;
+  font-family: var(--mono); font-size: 12px;
+  transition: border-color var(--transition);
+}
+.entry:hover { border-color: var(--border-light); }
+.entry .time { color: var(--dim); min-width: 65px; font-variant-numeric: tabular-nums; }
+.entry .type { min-width: 70px; }
+.entry .msg { flex: 1; color: var(--text); word-break: break-all; }
+
+/* --- Scan result --- */
+.result-box {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 24px; margin-top: 16px;
+}
+.verdict-line {
+  display: flex; align-items: center; gap: 16px;
+  padding-bottom: 16px; margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.verdict {
+  font-size: 24px; font-weight: 700; letter-spacing: -0.3px;
+}
+.verdict.malicious, .verdict.high-risk { color: var(--red); }
+.verdict.suspicious { color: var(--yellow); }
+.verdict.no-active-injection-detected { color: var(--green); }
+.verdict.could-not-probe { color: var(--dim); }
+.score-badge {
+  font-family: var(--mono); font-size: 14px;
+  padding: 4px 12px; border-radius: 4px;
+  background: var(--surface3); color: var(--dim);
+}
+.probe-list { display: flex; flex-direction: column; gap: 8px; }
+.probe-item {
+  background: var(--surface2); border-radius: var(--radius);
+  padding: 10px 14px; border-left: 3px solid var(--border);
+}
+.probe-item.ok { border-left-color: var(--green); }
+.probe-item.fail { border-left-color: var(--red); }
+.probe-item.err { border-left-color: var(--yellow); }
+.probe-header { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.probe-finding { margin-left: 20px; margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--dim); }
+.probe-finding .sev { font-weight: 700; margin-right: 6px; }
+.probe-finding .sev.high { color: var(--red); }
+.probe-finding .sev.medium { color: var(--yellow); }
+.probe-finding .sev.low { color: var(--dim); }
+.note-list { margin-top: 12px; }
+.note-item { font-size: 12px; color: var(--dim); margin-left: 12px; margin-bottom: 3px; }
+
+/* --- Empty state --- */
+.empty { color: var(--dim); text-align: center; padding: 48px 20px; font-size: 13px; }
+.empty-icon { font-size: 32px; margin-bottom: 8px; opacity: 0.3; }
+
+/* --- Modal --- */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.65);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 100; animation: fadeIn 150ms ease;
+}
+.modal {
+  background: var(--surface); border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg); padding: 28px;
+  width: 520px; max-width: 92vw;
+}
+.modal h3 { margin-top: 0; color: var(--text-bright); }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 24px; }
+
+/* --- Toast --- */
+.toast {
+  position: fixed; bottom: 24px; right: 24px;
+  background: var(--surface); border: 1px solid var(--border-light);
+  border-radius: var(--radius); padding: 12px 18px; font-size: 13px;
+  z-index: 200; animation: slideIn 200ms ease;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+}
+.toast.error { border-color: var(--red); }
+.toast.success { border-color: var(--green); }
+@keyframes slideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+/* --- Toolbar --- */
+.toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+.toolbar h2 { margin: 0; }
+
+/* --- Scan form --- */
+.scan-form {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 20px; margin-bottom: 16px;
+}
+.scan-progress {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--dim); font-size: 13px; margin-top: 12px;
+}
+.spinner {
+  width: 14px; height: 14px;
+  border: 2px solid var(--border-light); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 600ms linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* --- Audit --- */
+.audit-summary {
+  display: flex; align-items: center; gap: 16px;
+  padding-bottom: 16px; margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="sidebar">
+    <div class="logo">
+      <div class="logo-title">holone</div>
+      <div class="logo-sub">v0.3.0</div>
+    </div>
+    <div class="nav" id="nav"></div>
+    <div class="sidebar-footer">
+      <div class="lang-toggle">
+        <button class="lang-btn active" data-lang="ru" onclick="setLang('ru')">RU</button>
+        <button class="lang-btn" data-lang="en" onclick="setLang('en')">EN</button>
+      </div>
+      <span id="footer-text">Secure by design</span>
+    </div>
+  </nav>
+  <main class="main" id="main"></main>
+</div>
+
+<script>
+// ============ i18n ============
+const I18N = {
+  ru: {
+    overview: 'Обзор', providers: 'Провайдеры', activity: 'Активность',
+    scan: 'Скан провайдера', audit: 'Аудит системы', rulesView: 'Правила',
+    proxy: 'Прокси', mode: 'Режим', rules: 'Правил', alerts: 'Алертов',
+    blocks: 'Блокировок', uptime: 'Время работы', running: 'запущен',
+    stopped: 'не запущен', recentEvents: 'Последние события', noEvents: 'Нет событий',
+    addProvider: 'Добавить', name: 'Название', baseUrl: 'Base URL',
+    model: 'Модель (опц.)', tags: 'Теги (через запятую)', added: 'Добавлен',
+    actions: 'Действия', delete: 'Удалить', cancel: 'Отмена', save: 'Сохранить',
+    newProvider: 'Новый провайдер', noProviders: 'Нет провайдеров',
+    clear: 'Очистить', scanning: 'Сканирование...', runAudit: 'Запустить аудит',
+    scanProvider: 'Сканировать', apiUrl: 'Base URL провайдера',
+    apiKey: 'API ключ (опц.)', modelField: 'Модель (опц.)',
+    verdict: 'Вердикт', riskScore: 'Риск', host: 'Хост',
+    official: 'Официальный', probes: 'Пробы', notes: 'Заметки',
+    summary: 'Сводка', recommendations: 'Рекомендации', certValidUntil: 'действителен до',
+    iocHits: 'IOC совпадения', check: 'Проверка', status: 'Статус',
+    details: 'Детали', issues: 'проблем', clean: 'чисто',
+    auditComplete: 'Аудит завершен', scanComplete: 'Скан завершен',
+    scanFailed: 'Скан не удался', auditFailed: 'Аудит не удался',
+    confirmDelete: 'Удалить провайдера?', providerAdded: 'Провайдер добавлен',
+    providerDeleted: 'Удален', cleared: 'Очищено', enterUrl: 'Введите URL',
+    secureByDesign: 'Защита по дизайну', proxyMonitor: 'Мониторинг прокси',
+    port: 'порт', toolCall: 'вызов инструмента', duration: 'время',
+    findings: 'находок', none: 'нет', yes: 'да', no: 'нет',
+    monitoring: 'монитор', block: 'блок', dashboard: 'дашборд',
+    scanResult: 'Результат сканирования', auditResult: 'Результат аудита',
+    scanningProbe: 'Сканирование проб...', runningAudit: 'Аудит выполняется...',
+    resolved: 'Резолвится', tls: 'TLS', issuer: 'эмитент', ageDays: 'дней',
+    protocol: 'Протокол', declared: 'объявлены', notDeclared: 'не объявлены',
+    noActiveInjection: 'Активных инъекций не обнаружено',
+    couldNotProbe: 'Не удалось проверить',
+    noScanData: 'Запустите скан для получения результатов',
+    noAuditData: 'Запустите аудит для проверки системы',
+    startProxy: 'Запустить прокси', stopProxy: 'Остановить прокси', activeProvider: 'Активный провайдер',
+    clientBaseUrl: 'Client Base URL', selectProvider: 'Выберите провайдера', proxyStarted: 'Прокси запущен', proxyStopped: 'Прокси остановлен', copyToClient: 'пропиши это в AI-клиенте', copied: 'Скопировано',
+    ruleId: 'ID правила', category: 'Категория', severity: 'Угроза', description: 'Описание', pattern: 'Паттерн',
+    rulesCatalog: 'Каталог правил', high: 'high', medium: 'medium', low: 'low', search: 'Поиск', all: 'Все', edit: 'Изменить', providerUpdated: 'Провайдер обновлён', use: 'Использовать', explain: 'Разбор', close: 'Закрыть', importProfiles: 'Импорт', exportProfiles: 'Экспорт', request: 'Запрос', findingsTitle: 'Сработавшие правила', requestBody: 'Тело запроса', noFindings: 'Нет детальных находок',
+  },
+  en: {
+    overview: 'Overview', providers: 'Providers', activity: 'Activity',
+    scan: 'Provider Scan', audit: 'System Audit', rulesView: 'Rules',
+    proxy: 'Proxy', mode: 'Mode', rules: 'Rules', alerts: 'Alerts',
+    blocks: 'Blocks', uptime: 'Uptime', running: 'running',
+    stopped: 'stopped', recentEvents: 'Recent Events', noEvents: 'No events',
+    addProvider: 'Add', name: 'Name', baseUrl: 'Base URL',
+    model: 'Model (opt.)', tags: 'Tags (comma-separated)', added: 'Added',
+    actions: 'Actions', delete: 'Delete', cancel: 'Cancel', save: 'Save',
+    newProvider: 'New Provider', noProviders: 'No providers',
+    clear: 'Clear', scanning: 'Scanning...', runAudit: 'Run Audit',
+    scanProvider: 'Scan', apiUrl: 'Provider Base URL',
+    apiKey: 'API Key (opt.)', modelField: 'Model (opt.)',
+    verdict: 'Verdict', riskScore: 'Risk Score', host: 'Host',
+    official: 'Official', probes: 'Probes', notes: 'Notes',
+    summary: 'Summary', recommendations: 'Recommendations', certValidUntil: 'valid until',
+    iocHits: 'IOC Hits', check: 'Check', status: 'Status',
+    details: 'Details', issues: 'issues', clean: 'clean',
+    auditComplete: 'Audit complete', scanComplete: 'Scan complete',
+    scanFailed: 'Scan failed', auditFailed: 'Audit failed',
+    confirmDelete: 'Delete provider?', providerAdded: 'Provider added',
+    providerDeleted: 'Deleted', cleared: 'Cleared', enterUrl: 'Enter URL',
+    secureByDesign: 'Secure by design', proxyMonitor: 'Proxy monitor',
+    port: 'port', toolCall: 'tool call', duration: 'duration',
+    findings: 'findings', none: 'none', yes: 'yes', no: 'no',
+    monitoring: 'monitor', block: 'block', dashboard: 'dashboard',
+    scanResult: 'Scan Result', auditResult: 'Audit Result',
+    scanningProbe: 'Scanning probes...', runningAudit: 'Running audit...',
+    resolved: 'Resolves', tls: 'TLS', issuer: 'issuer', ageDays: 'days',
+    protocol: 'Protocol', declared: 'declared', notDeclared: 'not declared',
+    noActiveInjection: 'No active injection detected',
+    couldNotProbe: 'Could not probe',
+    noScanData: 'Run a scan to see results', noAuditData: 'Run an audit to check the system',
+    startProxy: 'Start proxy', stopProxy: 'Stop proxy', activeProvider: 'Active provider',
+    clientBaseUrl: 'Client Base URL', selectProvider: 'Select provider', proxyStarted: 'Proxy started', proxyStopped: 'Proxy stopped', copyToClient: 'use this in your AI client', copied: 'Copied',
+    ruleId: 'Rule ID', category: 'Category', severity: 'Severity', description: 'Description', pattern: 'Pattern',
+    rulesCatalog: 'Rules Catalog', high: 'high', medium: 'medium', low: 'low', search: 'Search', all: 'All', edit: 'Edit', providerUpdated: 'Provider updated', use: 'Use', explain: 'Explain', close: 'Close', importProfiles: 'Import', exportProfiles: 'Export', request: 'Request', findingsTitle: 'Triggered rules', requestBody: 'Request body', noFindings: 'No detailed findings',
+  }
+};
+let lang = 'ru';
+function t(key) { return (I18N[lang] && I18N[lang][key]) || key; }
+function setLang(l) {
+  lang = l;
+  document.querySelectorAll('.lang-btn').forEach(b => b.classList.toggle('active', b.dataset.lang === l));
+  renderNav();
+  renderCurrentView();
+}
+
+// ============ State ============
+let currentView = 'overview';
+let scanInProgress = false;
+let auditInProgress = false;
+let scanResult = null;
+let auditResult = null;
+let statusCache = null;
+let rulesCache = null;
+
+// ============ API ============
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({error: r.statusText}));
+    throw new Error(e.error || 'Request failed');
+  }
+  return r.json();
+}
+function toast(msg, type) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (type ? ' ' + type : '');
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ============ Navigation ============
+const NAV_ITEMS = [
+  {id:'overview', icon:'<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="1" width="6" height="6" rx="1"/><rect x="9" y="1" width="6" height="6" rx="1"/><rect x="1" y="9" width="6" height="6" rx="1"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>'},
+  {id:'providers', icon:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="13" height="3" rx="1"/><rect x="1.5" y="6.5" width="13" height="3" rx="1"/><rect x="1.5" y="11.5" width="13" height="3" rx="1"/></svg>'},
+  {id:'activity', icon:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 8h3l2-5 3 10 2-5h4"/></svg>'},
+  {id:'scan', icon:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5"/><path d="M11 11l4 4"/></svg>'},
+  {id:'audit', icon:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1l6 3v4c0 4-3 6-6 7-3-1-6-3-6-7V4l6-3z"/></svg>'},
+  {id:'rulesView', icon:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h12M2 8h12M2 13h12"/></svg>'},
+];
+
+function renderNav() {
+  const nav = document.getElementById('nav');
+  nav.innerHTML = NAV_ITEMS.map(item =>
+    `<div class="nav-item ${item.id===currentView?'active':''}" data-view="${item.id}" onclick="switchView('${item.id}')">
+      <span class="nav-icon">${item.icon}</span>
+      <span>${t(item.id)}</span>
+    </div>`
+  ).join('');
+  document.getElementById('footer-text').textContent = t('secureByDesign');
+}
+
+function switchView(view) {
+  currentView = view;
+  renderNav();
+  renderCurrentView();
+}
+
+function renderCurrentView() {
+  const main = document.getElementById('main');
+  if (currentView === 'overview') renderOverview(main);
+  else if (currentView === 'providers') renderProviders(main);
+  else if (currentView === 'activity') renderActivity(main);
+  else if (currentView === 'scan') renderScan(main);
+  else if (currentView === 'audit') renderAudit(main);
+  else if (currentView === 'rulesView') renderRules(main);
+}
+
+// ============ Overview ============
+async function renderOverview(main) {
+  main.innerHTML = `<h2>${t('overview')}</h2><div class="cards" id="status-cards"></div><div id="proxy-controls" style="margin-bottom:28px"></div><h3>${t('recentEvents')}</h3><div class="feed" id="recent-activity"></div>`;
+  try {
+    const [status, activity, providers] = await Promise.all([api('/api/status'), api('/api/activity'), api('/api/providers')]);
+    statusCache = status;
+    const running = status.proxy_running;
+    const cards = document.getElementById('status-cards');
+    cards.innerHTML = `
+      <div class="card ${running?'ok':'alert'}">
+        <div class="label">${t('proxy')}</div>
+        <div class="value">${running?'ON':'OFF'}</div>
+        <div class="sub">${running ? status.upstream : t('stopped')}</div>
+      </div>
+      <div class="card"><div class="label">${t('mode')}</div><div class="value" style="font-size:16px">${esc(status.mode||'—')}</div><div class="sub">${esc(status.listen_addr||'')}</div></div>
+      <div class="card"><div class="label">${t('clientBaseUrl')}</div><div class="value" style="font-size:16px">${esc(status.client_base_url||'http://127.0.0.1:8787')}</div><div class="sub">${t('copyToClient')}</div></div>
+      <div class="card"><div class="label">${t('activeProvider')}</div><div class="value" style="font-size:16px">${esc(status.provider_name||'—')}</div><div class="sub">${esc(status.upstream||'')}</div></div>
+      <div class="card"><div class="label">${t('rules')}</div><div class="value">${status.rules_count||0}</div></div>
+      <div class="card alert"><div class="label">${t('alerts')}</div><div class="value">${status.alerts_total||0}</div></div>
+      <div class="card alert"><div class="label">${t('blocks')}</div><div class="value">${status.blocks_total||0}</div></div>
+    `;
+    document.getElementById('proxy-controls').innerHTML = renderProxyControls(status, providers);
+    renderFeed(document.getElementById('recent-activity'), activity.slice(0, 10), t('noEvents'));
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// ============ Providers ============
+async function renderProviders(main) {
+  main.innerHTML = `
+    <div class="toolbar"><h2>${t('providers')}</h2><div style="display:flex;gap:8px"><button class="btn secondary" onclick="exportProfiles()">${t('exportProfiles')}</button><button class="btn secondary" onclick="importProfiles()">${t('importProfiles')}</button><button class="btn" onclick="showAddProvider()">+ ${t('addProvider')}</button></div></div>
+    <div class="table-wrap" id="providers-table"></div>
+    <div class="empty" id="providers-empty" style="display:none">${t('noProviders')}</div>`;
+  try {
+    const list = await api('/api/providers');
+    const el = document.getElementById('providers-table');
+    const empty = document.getElementById('providers-empty');
+    if (list.length === 0) { el.innerHTML = ''; empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    el.innerHTML = `<table>
+      <thead><tr><th>ID</th><th>${t('name')}</th><th>${t('baseUrl')}</th><th>${t('model')}</th><th>${t('tags')}</th><th>${t('added')}</th><th></th></tr></thead>
+      <tbody>${list.map(p => `<tr>
+        <td>${p.id}</td>
+        <td>${esc(p.name)}</td>
+        <td class="td-mono">${esc(p.base_url)}</td>
+        <td class="td-mono">${esc(p.model||'—')}</td>
+        <td>${(p.tags||[]).map(tg=>`<span class="badge dim">${esc(tg)}</span>`).join(' ')}</td>
+        <td style="color:var(--dim);font-size:12px">${esc((p.added||'').slice(0,10))}</td>
+        <td style="display:flex;gap:6px"><button class="btn small" onclick="startProxy('${p.id}')">${t('use')}</button><button class="btn secondary small" onclick="editProvider('${p.id}')">${t('edit')}</button><button class="btn danger small" onclick="delProvider('${p.id}')">${t('delete')}</button></td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+function showAddProvider() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>${t('newProvider')}</h3>
+      <div class="field"><label>${t('name')}</label><input id="p-name" placeholder="My Provider"></div>
+      <div class="field"><label>${t('baseUrl')}</label><input id="p-url" placeholder="https://api.example.com"></div>
+      <div class="form-row">
+        <div class="field"><label>${t('model')}</label><input id="p-model" placeholder="claude-3-5-sonnet"></div>
+        <div class="field"><label>${t('tags')}</label><input id="p-tags" placeholder="anthropic, openai"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn secondary" onclick="this.closest('.modal-overlay').remove()">${t('cancel')}</button>
+        <button class="btn" id="p-save">${t('save')}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#p-save').addEventListener('click', async () => {
+    const name = overlay.querySelector('#p-name').value.trim();
+    const url = overlay.querySelector('#p-url').value.trim();
+    const model = overlay.querySelector('#p-model').value.trim();
+    const tags = overlay.querySelector('#p-tags').value.split(',').map(s=>s.trim()).filter(Boolean);
+    if (!name || !url) { toast(t('enterUrl'), 'error'); return; }
+    try {
+      await api('/api/providers', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name, base_url:url, model, tags})});
+      overlay.remove(); renderCurrentView(); toast(t('providerAdded'), 'success');
+    } catch(e) { toast(e.message, 'error'); }
+  });
+}
+
+async function editProvider(id) {
+  try {
+    const providers = await api('/api/providers');
+    const p = providers.find(x => x.id === id);
+    if (!p) { toast('not found', 'error'); return; }
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal">
+        <h3>${t('edit')} — ${esc(p.name)}</h3>
+        <div class="field"><label>${t('name')}</label><input id="p-name" value="${esc(p.name)}"></div>
+        <div class="field"><label>${t('baseUrl')}</label><input id="p-url" value="${esc(p.base_url)}"></div>
+        <div class="form-row">
+          <div class="field"><label>${t('model')}</label><input id="p-model" value="${esc(p.model||'')}"></div>
+          <div class="field"><label>${t('tags')}</label><input id="p-tags" value="${esc((p.tags||[]).join(', '))}"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn secondary" onclick="this.closest('.modal-overlay').remove()">${t('cancel')}</button>
+          <button class="btn" id="p-save">${t('save')}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector('#p-save').addEventListener('click', async () => {
+      const name = overlay.querySelector('#p-name').value.trim();
+      const url = overlay.querySelector('#p-url').value.trim();
+      const model = overlay.querySelector('#p-model').value.trim();
+      const tags = overlay.querySelector('#p-tags').value.split(',').map(s=>s.trim()).filter(Boolean);
+      try {
+        await api('/api/providers?id='+encodeURIComponent(id), {method:'PUT', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({name, base_url:url, model, tags})});
+        overlay.remove(); renderCurrentView(); toast(t('providerUpdated'), 'success');
+      } catch(e) { toast(e.message, 'error'); }
+    });
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function delProvider(id) {
+  if (!confirm(t('confirmDelete'))) return;
+  try { await api('/api/providers?id='+id, {method:'DELETE'}); renderCurrentView(); toast(t('providerDeleted'), 'success'); }
+  catch(e) { toast(e.message, 'error'); }
+}
+
+// ============ Activity ============
+async function renderActivity(main) {
+  main.innerHTML = `<div class="toolbar"><h2>${t('activity')}</h2><button class="btn danger small" onclick="clearActivity()">${t('clear')}</button></div><div class="feed" id="activity-feed"></div><div class="empty" id="activity-empty" style="display:none">${t('noEvents')}</div>`;
+  try {
+    const list = await api('/api/activity');
+    renderFeed(document.getElementById('activity-feed'), list, t('noEvents'), document.getElementById('activity-empty'));
+  } catch(e) { toast(e.message, 'error'); }
+}
+async function clearActivity() {
+  try { await api('/api/activity', {method:'DELETE'}); renderCurrentView(); toast(t('cleared'), 'success'); }
+  catch(e) { toast(e.message, 'error'); }
+}
+
+function renderFeed(container, items, emptyMsg, emptyEl) {
+  if (!items || items.length === 0) {
+    container.innerHTML = '';
+    if (emptyEl) emptyEl.style.display = 'block';
+    else container.innerHTML = `<div class="empty">${emptyMsg}</div>`;
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+  container.innerHTML = items.map(e => {
+    const cls = e.type === 'blocked' ? 'red' : e.type === 'alert' ? 'yellow' : e.type === 'clean' ? 'green' : 'dim';
+    const rules = (e.rule_ids||[]).map(id => `<span class="badge dim">${esc(id)}</span>`).join(' ');
+    return `<div class="entry">
+      <span class="time">${esc(e.time||'')}</span>
+      <span class="type"><span class="badge ${cls}">${esc(e.type||'')}</span></span>
+      <span class="msg" onclick='showActivityDetails(${JSON.stringify(JSON.stringify(e))})' style="cursor:pointer">${esc(e.message || e.verdict || '')} ${rules ? '<span style="display:inline-flex;gap:4px;flex-wrap:wrap;margin-left:8px">'+rules+'</span>' : ''}</span>
+    </div>`;
+  }).join('');
+}
+
+async function exportProfiles() {
+  try {
+    const payload = await api('/api/providers/export');
+    const text = JSON.stringify(payload, null, 2);
+    await navigator.clipboard.writeText(text);
+    toast(t('copied'), 'success');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function importProfiles() {
+  const raw = prompt('Paste profiles JSON');
+  if (!raw) return;
+  try {
+    await api('/api/providers/import', {method:'POST', headers:{'Content-Type':'application/json'}, body: raw});
+    renderCurrentView();
+    toast(t('importProfiles'), 'success');
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+function showActivityDetails(raw) {
+  const e = JSON.parse(raw);
+  const findings = (e.findings||[]).length ? (e.findings||[]).map(f => `<div class="probe-finding"><span class="sev ${f.severity}">[${f.severity}]</span>${esc(f.rule_id)} — ${esc(f.description||'')}</div>`).join('') : `<div class="empty">${t('noFindings')}</div>`;
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal" style="width:760px;max-width:96vw"><h3>${esc(e.message||e.type||'')}</h3><div class="field"><label>${t('details')}</label><div class="td-mono">${esc(JSON.stringify({type:e.type,provider:e.provider,protocol:e.protocol,verdict:e.verdict,path:e.path,method:e.method,max_severity:e.max_severity}, null, 2))}</div></div>${e.request_body?`<div class="field"><label>${t('requestBody')}</label><div class="td-mono">${esc(e.request_body)}</div></div>`:''}<div class="field"><label>${t('findingsTitle')}</label>${findings}</div><div class="modal-actions"><button class="btn secondary" onclick="this.closest('.modal-overlay').remove()">${t('close')}</button></div></div>`;
+  document.body.appendChild(overlay);
+}
+
+// ============ Proxy Management ============
+async function startProxy(providerId, mode='monitor') {
+  try {
+    await api('/api/proxy/start', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({provider_id: providerId, listen_addr: '127.0.0.1:8787', mode})});
+    toast(t('proxyStarted'), 'success');
+    renderCurrentView();
+  } catch(e) { toast(e.message, 'error'); }
+}
+async function stopProxy() {
+  try {
+    await api('/api/proxy/stop', {method:'POST'});
+    toast(t('proxyStopped'), 'success');
+    renderCurrentView();
+  } catch(e) { toast(e.message, 'error'); }
+}
+function renderProxyControls(status, providers) {
+  const options = (providers||[]).map(p => `<option value="${esc(p.id)}" ${p.id===status.provider_id?'selected':''}>${esc(p.name)} — ${esc(p.base_url)}</option>`).join('');
+  const mode = status.mode || 'monitor';
+  return `<div class="scan-form">
+    <div class="form-row-3">
+      <div class="field"><label>${t('activeProvider')}</label><select id="proxy-provider"><option value="">${t('selectProvider')}</option>${options}</select></div>
+      <div class="field"><label>${t('mode')}</label><select id="proxy-mode"><option value="monitor" ${mode==='monitor'?'selected':''}>monitor</option><option value="block" ${mode==='block'?'selected':''}>block</option></select></div>
+      <div class="field" style="display:flex;align-items:flex-end;gap:8px">
+        <button class="btn" style="width:100%" onclick="startSelectedProxy()">${t('startProxy')}</button>
+        <button class="btn danger" style="width:100%" onclick="stopProxy()">${t('stopProxy')}</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="client-base-url" readonly value="${esc(status.client_base_url||'http://127.0.0.1:8787')}" class="td-mono">
+      <button class="btn secondary" onclick="copyClientBaseUrl()">copy</button>
+    </div>
+  </div>`;
+}
+async function startSelectedProxy() {
+  const providerId = document.getElementById('proxy-provider').value;
+  const mode = document.getElementById('proxy-mode').value || 'monitor';
+  if (!providerId) { toast(t('selectProvider'), 'error'); return; }
+  try {
+    await api('/api/proxy/start', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({provider_id: providerId, listen_addr: '127.0.0.1:8787', mode})});
+    toast(t('proxyStarted'), 'success');
+    renderCurrentView();
+  } catch(e) { toast(e.message, 'error'); }
+}
+async function copyClientBaseUrl() {
+  const value = document.getElementById('client-base-url').value;
+  try { await navigator.clipboard.writeText(value); toast(t('copied'), 'success'); }
+  catch(e) { toast(value, 'success'); }
+}
+
+// ============ Scan ============
+function renderScan(main) {
+  main.innerHTML = `
+    <h2>${t('scan')}</h2>
+    <div class="scan-form">
+      <div class="field"><label>${t('apiUrl')}</label><input id="scan-url" placeholder="https://api.example.com" onkeydown="if(event.key==='Enter')doScan()"></div>
+      <div class="form-row-3">
+        <div class="field"><label>${t('apiKey')}</label><input id="scan-key" type="password" placeholder="sk-..."></div>
+        <div class="field"><label>${t('modelField')}</label><input id="scan-model" placeholder="gpt-4o-mini"></div>
+        <div class="field" style="display:flex;align-items:flex-end"><button class="btn" style="width:100%" onclick="doScan()" id="scan-btn">${t('scanProvider')}</button></div>
+      </div>
+      <div id="scan-progress"></div>
+    </div>
+    <div id="scan-result">${scanResult ? renderScanResultHTML(scanResult) : `<div class="empty">${t('noScanData')}</div>`}</div>`;
+}
+
+async function doScan() {
+  if (scanInProgress) return;
+  const url = document.getElementById('scan-url').value.trim();
+  const key = document.getElementById('scan-key').value.trim();
+  const model = document.getElementById('scan-model').value.trim();
+  if (!url) { toast(t('enterUrl'), 'error'); return; }
+  scanInProgress = true;
+  const btn = document.getElementById('scan-btn');
+  btn.disabled = true;
+  document.getElementById('scan-progress').innerHTML = `<div class="scan-progress"><div class="spinner"></div>${t('scanningProbe')}</div>`;
+  document.getElementById('scan-result').innerHTML = '';
+  try {
+    const res = await api('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({base_url:url, api_key:key, model:model})});
+    scanResult = res;
+    document.getElementById('scan-result').innerHTML = renderScanResultHTML(res);
+    toast(t('scanComplete'), 'success');
+  } catch(e) {
+    document.getElementById('scan-result').innerHTML = `<div class="empty" style="color:var(--red)">${esc(e.message)}</div>`;
+    toast(t('scanFailed') + ': ' + e.message, 'error');
+  }
+  scanInProgress = false;
+  btn.disabled = false;
+  document.getElementById('scan-progress').innerHTML = '';
+}
+
+function renderScanResultHTML(r) {
+  const v = r.verdict || 'unknown';
+  const probes = (r.probes||[]).map(p => {
+    const cls = p.err ? 'err' : (p.saw_tool_call || (p.findings&&p.findings.length>0)) ? 'fail' : 'ok';
+    const findings = (p.findings||[]).map(f => `<div class="probe-finding"><span class="sev ${f.severity}">[${f.severity}]</span>${esc(f.rule_id)}: ${esc(f.match)}</div>`).join('');
+    return `<div class="probe-item ${cls}">
+      <div class="probe-header">
+        <span class="badge ${cls==='ok'?'green':cls==='fail'?'red':'yellow'}">${esc(p.protocol)}/${esc(p.name)}</span>
+        ${p.err ? `<span style="color:var(--red);font-size:12px">${esc(p.err)}</span>` : `<span style="color:var(--dim);font-size:12px">HTTP ${p.status} · ${p.duration_ms}ms</span>`}
+        ${p.saw_tool_call ? `<span class="badge red">TOOL_CALL</span>` : ''}
+        ${p.declared_tools ? `<span class="badge dim">${t('declared')}</span>` : `<span class="badge dim">${t('notDeclared')}</span>`}
+        ${p.findings && p.findings.length ? `<span class="badge yellow">${p.findings.length} ${t('findings')}</span>` : ''}
+      </div>
+      ${findings}
+    </div>`;
+  }).join('');
+  const ioc = r.blocklist_hits && r.blocklist_hits.length ? `<div style="margin-bottom:12px">${r.blocklist_hits.map(h=>`<span class="badge red">${esc(h)}</span>`).join(' ')}</div>` : '';
+  const summary = lang === 'ru' ? r.summary_ru : r.summary_en;
+  const notesData = lang === 'ru' ? (r.notes_ru || []) : (r.notes || []);
+  const recommendationsData = lang === 'ru' ? (r.recommendations_ru || []) : (r.recommendations_en || []);
+  const notes = notesData.map(n => `<div class="note-item">- ${esc(n)}</div>`).join('');
+  const recommendations = recommendationsData.map(n => `<div class="note-item">- ${esc(n)}</div>`).join('');
+  const tls = r.tls ? `<span style="color:var(--dim);font-size:12px;margin-left:12px">${t('tls')}: ${esc(r.tls.issuer)} (${r.tls.age_days} ${t('ageDays')}, ${t('certValidUntil')} ${esc(r.tls.not_after || '')})</span>` : '';
+  const ips = r.resolved_ips && r.resolved_ips.length ? `<span style="color:var(--dim);font-size:12px;margin-left:12px">${t('resolved')}: ${esc(r.resolved_ips.join(', '))}</span>` : '';
+  return `<div class="result-box">
+    <div class="verdict-line">
+      <div class="verdict ${v}">${v.toUpperCase()}</div>
+      <div class="score-badge">${t('riskScore')}: ${r.risk_score||0}</div>
+    </div>
+    <div style="margin-bottom:12px">
+      <span class="badge ${r.official?'green':'dim'}">${t('official')}: ${r.official?t('yes'):t('no')}</span>
+      <span style="color:var(--dim);font-size:12px;margin-left:12px">${t('host')}: ${esc(r.host||'')}</span>
+      ${tls}${ips}
+    </div>
+    ${ioc}
+    ${summary ? `<h3>${t('summary')}</h3><div class="note-list"><div class="note-item">${esc(summary)}</div></div>` : ''}
+    <h3>${t('probes')}</h3>
+    <div class="probe-list">${probes || `<div class="empty">${t('none')}</div>`}</div>
+    ${notes ? `<h3>${t('notes')}</h3><div class="note-list">${notes}</div>` : ''}
+    ${recommendations ? `<h3>${t('recommendations')}</h3><div class="note-list">${recommendations}</div>` : ''}
+  </div>`;
+}
+
+// ============ Audit ============
+function renderAudit(main) {
+  main.innerHTML = `
+    <div class="toolbar"><h2>${t('audit')}</h2><button class="btn" onclick="doAudit()" id="audit-btn">${t('runAudit')}</button></div>
+    <div id="audit-result">${auditResult ? renderAuditResultHTML(auditResult) : `<div class="empty">${t('noAuditData')}</div>`}</div>`;
+}
+
+async function doAudit() {
+  if (auditInProgress) return;
+  auditInProgress = true;
+  const btn = document.getElementById('audit-btn');
+  btn.disabled = true;
+  document.getElementById('audit-result').innerHTML = `<div class="scan-progress"><div class="spinner"></div>${t('runningAudit')}</div>`;
+  try {
+    const res = await api('/api/audit');
+    auditResult = res;
+    document.getElementById('audit-result').innerHTML = renderAuditResultHTML(res);
+    toast(t('auditComplete'), 'success');
+  } catch(e) {
+    document.getElementById('audit-result').innerHTML = `<div class="empty" style="color:var(--red)">${esc(e.message)}</div>`;
+    toast(t('auditFailed') + ': ' + e.message, 'error');
+  }
+  auditInProgress = false;
+  btn.disabled = false;
+}
+
+function renderAuditResultHTML(checks) {
+  if (!Array.isArray(checks)) return `<div class="empty">${t('none')}</div>`;
+  const infected = checks.filter(c => c.status === 'infected' || c.status === 'warn').length;
+  const verdict = infected ? `${infected} ${t('issues')}` : t('clean');
+  const vColor = infected ? 'malicious' : 'no-active-injection-detected';
+  return `<div class="result-box">
+    <div class="audit-summary">
+      <div class="verdict ${vColor}">${esc(verdict)}</div>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>${t('check')}</th><th>${t('status')}</th><th>${t('details')}</th></tr></thead>
+      <tbody>${checks.map(c => {
+        const cls = c.status==='infected'?'red':c.status==='warn'?'yellow':c.status==='error'?'yellow':'green';
+        return `<tr><td>${esc(c.name)}</td><td><span class="badge ${cls}">${esc(c.status)}</span></td><td style="font-size:12px">${esc(c.detail)}</td></tr>`;
+      }).join('')}</tbody>
+    </table></div>
+  </div>`;
+}
+
+// ============ Rules ============
+async function renderRules(main) {
+  main.innerHTML = `
+    <div class="toolbar"><h2>${t('rulesCatalog')}</h2><button class="btn secondary small" onclick="rulesCache=null;renderRules(document.getElementById('main'))">refresh</button></div>
+    <div class="scan-form">
+      <div class="form-row-3">
+        <div class="field"><label>${t('search')}</label><input id="rule-search" placeholder="dl-curl, credential, webhook..." oninput="applyRuleFilters()"></div>
+        <div class="field"><label>${t('severity')}</label><select id="rule-severity" onchange="applyRuleFilters()"><option value="">${t('all')}</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select></div>
+        <div class="field"><label>${t('category')}</label><select id="rule-category" onchange="applyRuleFilters()"><option value="">${t('all')}</option></select></div>
+      </div>
+    </div>
+    <div id="rules-list"></div>`;
+  try {
+    if (!rulesCache) rulesCache = await api('/api/rules');
+    const categories = [...new Set((rulesCache||[]).map(r => r.category))].sort();
+    document.getElementById('rule-category').innerHTML += categories.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+    applyRuleFilters();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+function applyRuleFilters() {
+  const q = (document.getElementById('rule-search')?.value || '').toLowerCase().trim();
+  const sev = document.getElementById('rule-severity')?.value || '';
+  const cat = document.getElementById('rule-category')?.value || '';
+  const list = (rulesCache || []).filter(r => {
+    const desc = lang === 'ru' ? r.description_ru : r.description_en;
+    const hay = [r.id, r.category, r.severity, r.pattern, desc].join(' ').toLowerCase();
+    return (!q || hay.includes(q)) && (!sev || r.severity === sev) && (!cat || r.category === cat);
+  });
+  const target = document.getElementById('rules-list');
+  if (!target) return;
+  target.innerHTML = `<div class="table-wrap"><table>
+    <thead><tr><th>${t('ruleId')}</th><th>${t('category')}</th><th>${t('severity')}</th><th>${t('description')}</th><th>${t('pattern')}</th></tr></thead>
+    <tbody>${list.map(r => {
+      const cls = r.severity === 'high' ? 'red' : r.severity === 'medium' ? 'yellow' : 'dim';
+      const desc = lang === 'ru' ? r.description_ru : r.description_en;
+      return `<tr>
+        <td class="td-mono">${esc(r.id)}</td>
+        <td><span class="badge dim">${esc(r.category)}</span></td>
+        <td><span class="badge ${cls}">${esc(r.severity)}</span></td>
+        <td><div>${esc(desc)}</div><div style="margin-top:8px"><button class="btn secondary small" onclick='showRuleExplain(${JSON.stringify(JSON.stringify(r))})'>${t('explain')}</button></div></td>
+        <td class="td-mono" style="max-width:360px;word-break:break-all;color:var(--dim)">${esc(r.pattern)}</td>
+      </tr>`;
+    }).join('')}</tbody></table></div>`;
+}
+
+function showRuleExplain(raw) {
+  const r = JSON.parse(raw);
+  const desc = lang === 'ru' ? r.description_ru : r.description_en;
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal" style="width:760px;max-width:96vw"><h3>${esc(r.id)}</h3><div class="field"><label>${t('category')}</label><div><span class="badge dim">${esc(r.category)}</span> <span class="badge ${r.severity==='high'?'red':r.severity==='medium'?'yellow':'dim'}">${esc(r.severity)}</span></div></div><div class="field"><label>${t('description')}</label><div>${esc(desc)}</div></div><div class="field"><label>${t('pattern')}</label><div class="td-mono">${esc(r.pattern)}</div></div><div class="modal-actions"><button class="btn secondary" onclick="this.closest('.modal-overlay').remove()">${t('close')}</button></div></div>`;
+  document.body.appendChild(overlay);
+}
+
+// ============ Init ============
+renderNav();
+renderCurrentView();
+setInterval(() => { if (currentView === 'overview') renderOverview(document.getElementById('main')); }, 5000);
+setInterval(() => { if (currentView === 'activity') renderActivity(document.getElementById('main')); }, 5000);
+</script>
+</body>
+</html>

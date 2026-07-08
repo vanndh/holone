@@ -53,11 +53,12 @@ func ParseSeverity(s string) Severity {
 const RuleAnomalyUnsolicitedTool = "proto-tooluse-unsolicited"
 
 type ruleSpec struct {
-	ID          string `json:"id"`
-	Category    string `json:"category"`
-	Severity    string `json:"severity"`
-	Pattern     string `json:"pattern"`
-	Description string `json:"description"`
+	ID            string `json:"id"`
+	Category      string `json:"category"`
+	Severity      string `json:"severity"`
+	Pattern       string `json:"pattern"`
+	Description   string `json:"description"`
+	DescriptionRU string `json:"description_ru,omitempty"`
 }
 
 type rulesFile struct {
@@ -69,6 +70,16 @@ type compiledRule struct {
 	spec ruleSpec
 	sev  Severity
 	re   *regexp.Regexp
+}
+
+// RuleInfo is a safe, UI-facing description of a detection rule.
+type RuleInfo struct {
+	ID            string `json:"id"`
+	Category      string `json:"category"`
+	Severity      string `json:"severity"`
+	Pattern       string `json:"pattern"`
+	DescriptionEN string `json:"description_en"`
+	DescriptionRU string `json:"description_ru"`
 }
 
 // Blocklist holds literal indicators of compromise.
@@ -180,6 +191,35 @@ func (e *Engine) Description(ruleID string) string {
 // RuleCount reports how many behavioral rules are loaded (for diagnostics).
 func (e *Engine) RuleCount() int { return len(e.rules) }
 
+// Rules returns a stable, UI-facing rule catalog.
+func (e *Engine) Rules() []RuleInfo {
+	out := make([]RuleInfo, 0, len(e.rules))
+	for _, r := range e.rules {
+		ru := strings.TrimSpace(r.spec.DescriptionRU)
+		if ru == "" {
+			ru = russianRuleDescription(r.spec)
+		}
+		out = append(out, RuleInfo{
+			ID:            r.spec.ID,
+			Category:      r.spec.Category,
+			Severity:      r.sev.String(),
+			Pattern:       r.spec.Pattern,
+			DescriptionEN: r.spec.Description,
+			DescriptionRU: ru,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Severity != out[j].Severity {
+			return ParseSeverity(out[i].Severity) > ParseSeverity(out[j].Severity)
+		}
+		if out[i].Category != out[j].Category {
+			return out[i].Category < out[j].Category
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
 // Inspect scans a single piece of text and returns all findings. source is a
 // short label describing where the text came from (e.g. "tool_use:Bash").
 func (e *Engine) Inspect(text, source string) []Finding {
@@ -255,6 +295,38 @@ func SortFindings(fs []Finding) {
 		}
 		return fs[i].RuleID < fs[j].RuleID
 	})
+}
+
+func russianRuleDescription(r ruleSpec) string {
+	category := map[string]string{
+		"download-exec":      "загрузка и выполнение кода",
+		"obfuscation":        "обфускация или скрытое выполнение",
+		"persistence":        "закрепление в системе",
+		"network":            "изменение сети или прокси",
+		"anti-forensics":     "анти-форензика",
+		"locale":             "изменение локали",
+		"client-config":      "отравление конфигурации AI-клиента",
+		"credential-theft":   "кража учётных данных",
+		"exfil":              "эксфильтрация данных",
+		"git-attack":         "атака на git или CI",
+		"supply-chain":       "атака на цепочку поставки",
+		"process-injection":  "инъекция в процесс",
+		"uac-bypass":         "обход UAC",
+		"defense-evasion":    "отключение или обход защиты",
+		"container-escape":   "выход из контейнера",
+		"thinking-injection": "скрытая инъекция через thinking-блоки",
+	}
+	severity := map[string]string{
+		"high":   "высокий риск: блокировать в block-режиме",
+		"medium": "средний риск: показать оператору и проверить контекст",
+		"low":    "низкий риск: слабый сигнал для корреляции",
+	}
+	cat := category[r.Category]
+	if cat == "" {
+		cat = r.Category
+	}
+	sev := severity[ParseSeverity(r.Severity).String()]
+	return fmt.Sprintf("%s; %s. Срабатывает на технику: %s", cat, sev, r.Description)
 }
 
 func truncate(s string, n int) string {

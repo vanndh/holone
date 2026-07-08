@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vanndh/holone/internal/inspect"
@@ -29,6 +30,7 @@ type ProbeResult struct {
 	SawToolCall   bool              `json:"saw_tool_call"`
 	Findings      []inspect.Finding `json:"findings,omitempty"`
 	Status        int               `json:"status"`
+	DurationMs    int64             `json:"duration_ms"`
 	Err           string            `json:"error,omitempty"`
 }
 
@@ -43,16 +45,21 @@ type TLSInfo struct {
 
 // Result is the full scan report.
 type Result struct {
-	Endpoint      string        `json:"endpoint"`
-	Host          string        `json:"host"`
-	Official      bool          `json:"official"`
-	ResolvedIPs   []string      `json:"resolved_ips,omitempty"`
-	BlocklistHits []string      `json:"blocklist_hits,omitempty"`
-	TLS           *TLSInfo      `json:"tls,omitempty"`
-	Probes        []ProbeResult `json:"probes"`
-	RiskScore     int           `json:"risk_score"`
-	Verdict       string        `json:"verdict"`
-	Notes         []string      `json:"notes,omitempty"`
+	Endpoint          string        `json:"endpoint"`
+	Host              string        `json:"host"`
+	Official          bool          `json:"official"`
+	ResolvedIPs       []string      `json:"resolved_ips,omitempty"`
+	BlocklistHits     []string      `json:"blocklist_hits,omitempty"`
+	TLS               *TLSInfo      `json:"tls,omitempty"`
+	Probes            []ProbeResult `json:"probes"`
+	RiskScore         int           `json:"risk_score"`
+	Verdict           string        `json:"verdict"`
+	SummaryEN         string        `json:"summary_en"`
+	SummaryRU         string        `json:"summary_ru"`
+	Notes             []string      `json:"notes,omitempty"`
+	NotesRU           []string      `json:"notes_ru,omitempty"`
+	RecommendationsEN []string      `json:"recommendations_en,omitempty"`
+	RecommendationsRU []string      `json:"recommendations_ru,omitempty"`
 }
 
 var officialHosts = map[string]bool{
@@ -60,16 +67,22 @@ var officialHosts = map[string]bool{
 	"api.openai.com":    true,
 }
 
+// ProgressFunc is called as each probe completes so callers can show live
+// feedback. probeName is "anthropic/no-tool", "openai/no-tool" etc. status is
+// "ok", "fail", "error". findings is non-zero count.
+type ProgressFunc func(probeName string, status string, findings int, err string)
+
 // Options configures a scan.
 type Options struct {
-	BaseURL string
-	APIKey  string
-	Model   string // model name to request; defaults applied if empty
-	Engine  *inspect.Engine
-	Client  *http.Client // optional override (tests)
+	BaseURL  string
+	APIKey   string
+	Model    string
+	Engine   *inspect.Engine
+	Client   *http.Client
+	Progress ProgressFunc
 }
 
-// Scan runs all probes and returns a report.
+// Scan runs all probes concurrently and returns a report.
 func Scan(ctx context.Context, opt Options) (*Result, error) {
 	if opt.Engine == nil {
 		eng, err := inspect.Default()
@@ -93,11 +106,17 @@ func Scan(ctx context.Context, opt Options) (*Result, error) {
 		Official: officialHosts[strings.ToLower(u.Hostname())],
 	}
 
+	// Phase 1: structural checks (fast, concurrent).
 	bl, _ := inspect.DefaultBlocklist()
-	res.ResolvedIPs = resolveIPs(ctx, u.Hostname())
-	res.BlocklistHits = matchBlocklist(u.Hostname(), res.ResolvedIPs, bl)
-	res.TLS = probeTLS(u)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); res.ResolvedIPs = resolveIPs(ctx, u.Hostname()) }()
+	go func() { defer wg.Done(); res.TLS = probeTLS(u) }()
+	wg.Wait()
 
+	res.BlocklistHits = matchBlocklist(u.Hostname(), res.ResolvedIPs, bl)
+
+	// Phase 2: behavioral probes.
 	prompt := "Reply with a single short sentence greeting. Do not call any tools."
 	amodel, omodel := opt.Model, opt.Model
 	if amodel == "" {
@@ -107,18 +126,46 @@ func Scan(ctx context.Context, opt Options) (*Result, error) {
 		omodel = "gpt-4o-mini"
 	}
 
-	// Probe BOTH protocols so OpenAI-compatible-only providers are covered. A
-	// tool call in response to a no-tool prompt is a strong injection signal.
-	res.Probes = append(res.Probes,
-		probe(ctx, client, opt, u, "anthropic", "no-tool", anthropicBody(amodel, prompt)),
-		probe(ctx, client, opt, u, "openai", "no-tool", openaiBody(omodel, prompt)))
+	// Run all 4 probes concurrently for speed.
+	type probeJob struct {
+		name  string
+		proto string
+		body  []byte
+	}
+	jobs := []probeJob{
+		{"no-tool", "anthropic", anthropicBody(amodel, prompt)},
+		{"no-tool", "openai", openaiBody(omodel, prompt)},
+		{"with-tools", "anthropic", anthropicBodyWithTools(amodel, prompt)},
+		{"with-tools", "openai", openaiBodyWithTools(omodel, prompt)},
+	}
+
+	res.Probes = make([]ProbeResult, len(jobs))
+	var pw sync.WaitGroup
+	for i, j := range jobs {
+		pw.Add(1)
+		go func(idx int, job probeJob) {
+			defer pw.Done()
+			pr := probe(ctx, client, opt, u, job.proto, job.name, job.body)
+			res.Probes[idx] = pr
+			if opt.Progress != nil {
+				status := "ok"
+				if pr.Err != "" {
+					status = "error"
+				} else if pr.SawToolCall || len(pr.Findings) > 0 {
+					status = "fail"
+				}
+				opt.Progress(job.proto+"/"+job.name, status, len(pr.Findings), pr.Err)
+			}
+		}(i, j)
+	}
+	pw.Wait()
 
 	scoreResult(res)
 	return res, nil
 }
 
 func probe(ctx context.Context, client *http.Client, opt Options, base *url.URL, proto, name string, body []byte) ProbeResult {
-	pr := ProbeResult{Name: name, Protocol: proto}
+	pr := ProbeResult{Name: name, Protocol: proto, DeclaredTools: strings.Contains(name, "with-tools")}
 	var endpoint string
 	switch proto {
 	case "openai":
@@ -143,7 +190,9 @@ func probe(ctx context.Context, client *http.Client, opt Options, base *url.URL,
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
 
+	start := time.Now()
 	resp, err := client.Do(req)
+	pr.DurationMs = time.Since(start).Milliseconds()
 	if err != nil {
 		pr.Err = err.Error()
 		return pr
@@ -157,7 +206,6 @@ func probe(ctx context.Context, client *http.Client, opt Options, base *url.URL,
 		strings.Contains(text, `"function_call"`)
 	pr.Findings = opt.Engine.Inspect(text, "scan:"+proto+":"+name)
 	inspect.SortFindings(pr.Findings)
-	// Treat a non-2xx status as a failed probe so it cannot read as "clean".
 	if resp.StatusCode >= 400 {
 		pr.Err = fmt.Sprintf("HTTP %d", resp.StatusCode)
 	}
@@ -173,10 +221,29 @@ func anthropicBody(model, prompt string) []byte {
 	return b
 }
 
+func anthropicBodyWithTools(model, prompt string) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"model":      model,
+		"max_tokens": 128,
+		"messages":   []any{map[string]any{"role": "user", "content": prompt}},
+		"tools":      []any{map[string]any{"name": "Bash", "description": "Run a shell command", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}}},
+	})
+	return b
+}
+
 func openaiBody(model, prompt string) []byte {
 	b, _ := json.Marshal(map[string]any{
 		"model":    model,
 		"messages": []any{map[string]any{"role": "user", "content": prompt}},
+	})
+	return b
+}
+
+func openaiBodyWithTools(model, prompt string) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"model":    model,
+		"messages": []any{map[string]any{"role": "user", "content": prompt}},
+		"tools":    []any{map[string]any{"type": "function", "function": map[string]any{"name": "run", "description": "Run a shell command", "parameters": map[string]any{"type": "object", "properties": map[string]any{"cmd": map[string]any{"type": "string"}}}}}},
 	})
 	return b
 }
@@ -239,50 +306,62 @@ func probeTLS(u *url.URL) *TLSInfo {
 	}
 }
 
-// scoreResult derives a risk score and verdict. Behavioral signals (IOC hits,
-// injected tool calls, payload patterns) are kept distinct from structural ones
-// (non-official host, fresh TLS cert) so that structural signals alone — which
-// are normal for honest independent providers — never cross into "suspicious".
 func scoreResult(res *Result) {
 	behavioral, structural := 0, 0
 
+	addNote := func(en, ru string) {
+		res.Notes = append(res.Notes, en)
+		res.NotesRU = append(res.NotesRU, ru)
+	}
+
 	for _, h := range res.BlocklistHits {
 		behavioral += 100
-		res.Notes = append(res.Notes, "KNOWN INDICATOR OF COMPROMISE: "+h)
+		addNote("Known IOC matched: "+h, "Найден известный индикатор компрометации: "+h)
 	}
 	if !res.Official {
 		structural += 10
-		res.Notes = append(res.Notes, "Non-official endpoint host: "+res.Host)
+		addNote("Non-official endpoint: "+res.Host, "Неофициальный endpoint: "+res.Host)
 	}
 
 	reachable := 0
+	failed := 0
+	toolCalls := 0
+	highFindings := 0
+	mediumOrLowFindings := 0
 	for _, p := range res.Probes {
 		if p.Err != "" {
-			res.Notes = append(res.Notes, fmt.Sprintf("probe %s/%s could not run: %s", p.Protocol, p.Name, p.Err))
+			failed++
+			addNote(fmt.Sprintf("Probe %s/%s failed: %s", p.Protocol, p.Name, p.Err), fmt.Sprintf("Проба %s/%s завершилась ошибкой: %s", p.Protocol, p.Name, p.Err))
 			continue
 		}
 		reachable++
+		if p.SawToolCall {
+			toolCalls++
+		}
 		if !p.DeclaredTools && p.SawToolCall {
 			behavioral += 60
-			res.Notes = append(res.Notes, "Endpoint returned a tool call for a prompt that declared no tools ("+p.Protocol+") — strong injection signal")
+			addNote("Unsolicited tool call in "+p.Protocol+" "+p.Name+" probe — strong injection signal", "Непрошеный вызов инструмента в пробе "+p.Protocol+" "+p.Name+" — сильный признак инъекции")
 		}
 		if inspect.MaxSeverity(p.Findings) == inspect.SevHigh {
 			behavioral += 40
-			res.Notes = append(res.Notes, "High-severity payload pattern in response ("+p.Protocol+")")
+			highFindings += len(p.Findings)
+			addNote("High-severity payload pattern in "+p.Protocol+" response", "High-severity payload-паттерн в ответе "+p.Protocol)
 		} else if len(p.Findings) > 0 {
 			behavioral += 15
+			mediumOrLowFindings += len(p.Findings)
+			addNote("Suspicious payload pattern in "+p.Protocol+" response", "Подозрительный payload-паттерн в ответе "+p.Protocol)
 		}
 	}
 	if res.TLS != nil && res.TLS.AgeDays >= 0 && res.TLS.AgeDays < 14 {
 		structural += 5
-		res.Notes = append(res.Notes, fmt.Sprintf("TLS certificate is only %d days old", res.TLS.AgeDays))
+		addNote(fmt.Sprintf("TLS certificate is only %d days old", res.TLS.AgeDays), fmt.Sprintf("TLS-сертификату всего %d дн.", res.TLS.AgeDays))
 	}
 
 	res.RiskScore = behavioral + structural
 	switch {
 	case reachable == 0:
 		res.Verdict = "could-not-probe"
-		res.Notes = append(res.Notes, "All probes failed — could not actively test this endpoint (wrong model name? auth? unsupported protocol?). Try --model.")
+		addNote("All probes failed — could not test this endpoint (wrong model? auth? unsupported protocol?). Try --model.", "Все пробы упали — endpoint не удалось проверить (модель, авторизация или протокол могут не подходить). Попробуй --model.")
 	case behavioral >= 100:
 		res.Verdict = "malicious"
 	case behavioral >= 50:
@@ -290,9 +369,9 @@ func scoreResult(res *Result) {
 	case behavioral >= 15:
 		res.Verdict = "suspicious"
 	default:
-		// Structural-only signals never escalate past the clean band.
 		res.Verdict = "no-active-injection-detected"
 	}
-	res.Notes = append(res.Notes,
-		"NOTE: a clean result does NOT prove the provider is safe — it cannot detect passive prompt logging. Do not send secrets to non-official providers.")
+	res.SummaryEN, res.SummaryRU = scanSummary(res.Verdict, reachable, failed, toolCalls, highFindings, mediumOrLowFindings)
+	res.RecommendationsEN, res.RecommendationsRU = scanRecommendations(res)
+	addNote("A clean result does NOT prove safety — passive prompt logging cannot be detected. Do not send secrets to non-official providers.", "Чистый результат НЕ доказывает безопасность — пассивный слив промптов не детектируется. Не отправляй секреты неофициальным провайдерам.")
 }
