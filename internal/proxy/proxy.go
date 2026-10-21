@@ -121,13 +121,67 @@ func New(cfg Config) *Proxy {
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		// Bound a hostile upstream's response headers: without a cap the header
+		// block can grow until the process runs out of memory.
+		MaxResponseHeaderBytes: 1 << 20,
 	}
 	return &Proxy{
-		cfg:         cfg,
-		client:      &http.Client{Transport: transport, Timeout: 0},
+		cfg: cfg,
+		client: &http.Client{
+			Transport:     transport,
+			Timeout:       0,
+			CheckRedirect: checkUpstreamRedirect(cfg.Upstream),
+		},
 		maxRequest:  firstPositive(cfg.MaxRequestBytes, maxRequestBody),
 		maxResponse: firstPositive(cfg.MaxResponseBytes, maxResponseBody),
 	}
+}
+
+// maxRedirects is the longest redirect chain holone will follow.
+const maxRedirects = 5
+
+// redirectError is returned by CheckRedirect. ServeHTTP unwraps it and renders
+// only its reason, which never contains the redirect target's path or query —
+// a hostile Location header must not leak credentials into holone's output.
+type redirectError struct{ reason string }
+
+func (e *redirectError) Error() string { return "upstream redirect blocked: " + e.reason }
+
+// checkUpstreamRedirect only follows same-origin redirects (scheme, host and
+// effective port) and caps the chain length, so a hostile provider cannot bounce
+// holone into internal services (SSRF) or re-route the request elsewhere.
+func checkUpstreamRedirect(origin *url.URL) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) > maxRedirects {
+			return &redirectError{reason: fmt.Sprintf("stopped after %d redirects", maxRedirects)}
+		}
+		if origin == nil || !sameOrigin(origin, req.URL) {
+			return &redirectError{reason: "redirect to " + req.URL.Scheme + "://" + req.URL.Host + " is not same-origin"}
+		}
+		return nil
+	}
+}
+
+// sameOrigin reports whether two URLs share scheme, host and port.
+func sameOrigin(a, b *url.URL) bool {
+	if !strings.EqualFold(a.Scheme, b.Scheme) || !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	return originPort(a) == originPort(b)
+}
+
+// originPort returns the explicit port, or the scheme default.
+func originPort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
 }
 
 // firstPositive returns v when it is a usable limit, else def.
@@ -190,6 +244,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.client.Do(outReq)
 	if err != nil {
+		// A blocked redirect must not echo the target URL (it may carry query
+		// parameters or credentials); only the sanitized reason is surfaced.
+		var re *redirectError
+		if errors.As(err, &re) {
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+			http.Error(w, "holone: "+re.Error(), http.StatusBadGateway)
+			return
+		}
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
 		http.Error(w, "holone: upstream error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -631,11 +698,48 @@ func writeResponseHeaders(w http.ResponseWriter, resp *http.Response, streaming,
 	}
 }
 
+// singleJoin joins an upstream base path and a client request path without
+// duplicating a boundary segment. Providers are commonly configured with a base
+// URL that already ends in the API version ("https://host/api/v1") while the
+// client still sends the versioned path ("/v1/messages"); a naive join produces
+// "/api/v1/v1/messages". When the base's last segment equals the request's first
+// segment (case-insensitive) the request's copy is dropped.
 func singleJoin(a, b string) string {
 	if a == "" || a == "/" {
 		return b
 	}
-	return strings.TrimRight(a, "/") + "/" + strings.TrimLeft(b, "/")
+	base := strings.TrimRight(a, "/")
+	rest := strings.TrimLeft(b, "/")
+
+	if last := lastPathSegment(base); last != "" {
+		if first, tail, ok := firstPathSegment(rest); ok && strings.EqualFold(first, last) {
+			if tail == "" {
+				return base
+			}
+			rest = tail
+		}
+	}
+	return base + "/" + rest
+}
+
+// lastPathSegment returns the final non-empty segment of a path.
+func lastPathSegment(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+// firstPathSegment splits the first segment off a path and reports whether one
+// existed.
+func firstPathSegment(p string) (seg, rest string, ok bool) {
+	if p == "" {
+		return "", "", false
+	}
+	if i := strings.IndexByte(p, '/'); i >= 0 {
+		return p[:i], p[i+1:], true
+	}
+	return p, "", true
 }
 
 // Logger writes newline-delimited JSON audit records, concurrency-safe.

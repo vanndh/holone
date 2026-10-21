@@ -4,7 +4,30 @@
 [keep a changelog](https://keepachangelog.com/), версионирование стремится
 следовать [semver](https://semver.org/).
 
-## [0.4.0] — unreleased
+## [0.4.1] — 2026-10-21
+
+### безопасность
+
+- **SSE line cap 1 MiB и frame cap 4 MiB** — одна бесконечная строка или много
+  строк без пустого разделителя больше не растят память. в monitor все байты
+  форвардятся, но выставляется high `proto-sse-line-oversized` /
+  `proto-sse-frame-oversized`; в block — fail-closed с корректным терминальным
+  событием по протоколу.
+- **редиректы upstream** — только same-origin (scheme + host + port), максимум
+  5 шагов, иначе `502`. `Location` path/query не логируется (SSRF и утечка).
+- **upstream path join** — base `https://host/api/v1` + запрос `/v1/messages`
+  больше не даёт `/api/v1/v1/messages`.
+- **MaxResponseHeaderBytes = 1 MiB** — память на заголовки ответа ограничена.
+- **исправлен баг rolling-окна** — один большой `Write` инспектировался не
+  полностью, хвост терялся.
+
+### добавлено
+
+- **npm-пакет `holone`** в каталоге `npm/`: postinstall качает бинарь нужной
+  платформы, сверяет SHA-256 по `SHA256SUMS.txt`, шим `bin/holone.js`.
+  публикация: `cd npm && npm login && npm publish --access public`.
+
+## [0.4.0] — 2026-10-21
 
 хардненинг прокси, инспекции и поставки: закрыты обходы лимитов, слепые зоны
 стрима и непроверенные кодировки, добавлена нативная поддержка OpenAI Responses.
@@ -206,6 +229,7 @@
   вредоносного провайдера (`mockevil`), бенчмарки латентности и ci под
   windows/macos/linux.
 
+[0.4.1]: https://github.com/vanndh/holone/releases/tag/v0.4.1
 [0.4.0]: https://github.com/vanndh/holone/releases/tag/v0.4.0
 [0.3.0]: https://github.com/vanndh/holone/releases/tag/v0.3.0
 [0.2.0]: https://github.com/vanndh/holone/releases/tag/v0.2.0

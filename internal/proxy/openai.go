@@ -90,7 +90,7 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 			accumulate(c)
 			return nil
 		}
-		_ = readSSE(r, onLine, onEvent)
+		_ = readSSE(r, onLine, onEvent, p.monitorOversized(st))
 		inspectTools()
 		st.add(content.Finish()...)
 		return
@@ -220,7 +220,27 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 		return finalize(ev.raw, chunkText)
 	}
 
-	_ = readSSE(r, nil, onEvent)
+	// An uninspectable line cannot be safely rewritten, so fail closed: drop the
+	// buffered tool call, emit a safety note plus a normal finish chunk and the
+	// [DONE] sentinel so the client stream terminates cleanly.
+	onOversized := func(ruleID string, n int) error {
+		st.add(oversizedSSEFinding(ruleID, n))
+		st.blocked = true
+		bufChunks, bufContent = nil, nil
+		toolArgs = map[int]*streamInspector{}
+		if e := emit(openaiNoteChunk(ruleID)); e != nil {
+			return e
+		}
+		if e := emit(openaiFinishChunk("stop")); e != nil {
+			return e
+		}
+		if e := emit([]byte("data: [DONE]\n\n")); e != nil {
+			return e
+		}
+		return errSSELineOversized
+	}
+
+	_ = readSSE(r, nil, onEvent, onOversized)
 	// Buffered tool calls with no finish chunk (EOF/disconnect) must still be
 	// inspected and resolved, not silently dropped.
 	if len(bufChunks) > 0 || oversized {

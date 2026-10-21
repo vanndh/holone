@@ -18,7 +18,7 @@ func (p *Proxy) streamGeneric(w http.ResponseWriter, flusher http.Flusher, r *bu
 		}
 		return nil
 	}
-	_ = readSSE(r, onLine, onEvent)
+	_ = readSSE(r, onLine, onEvent, p.monitorOversized(st))
 	st.add(insp.Finish()...)
 	// No reliable tool-call signal for unknown formats; anomaly check is skipped
 	// and Block mode cannot enforce anything here (Decision.Protection reports

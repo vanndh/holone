@@ -88,6 +88,14 @@ curl -fsSL https://raw.githubusercontent.com/vanndh/holone/main/scripts/install.
 сверяют sha-256 скачанного бинаря. при несовпадении или отсутствии записи —
 ошибка и отказ: файл не становится исполняемым и не попадает в `PATH`.
 
+**через npm** (пакет готовится к публикации, лежит в [`npm/`](npm/)):
+
+```sh
+npm i -g holone
+```
+
+postinstall скачивает бинарь из GitHub Releases и сверяет sha-256 до установки.
+
 **через go** (нужен go 1.26+):
 
 ```sh
@@ -170,6 +178,14 @@ holone proxy --upstream <url-провайдера> [--listen 127.0.0.1:8787] [--
 ответу, а не только в первых мегабайтах — слепой зоны после 1 MiB больше нет.
 в block-режиме буферизация tool-call ограничена 8 MiB: превышение — fail-closed,
 вызов заменяется безопасной заметкой и high-finding `proto-toolcall-oversized`.
+
+SSE-парсер ограничен: одна строка — 1 MiB, целый кадр — 4 MiB. в monitor байты
+по-прежнему форвардятся, но превышение даёт high `proto-sse-line-oversized` /
+`proto-sse-frame-oversized`; в block — fail-closed с корректным терминальным
+событием протокола.
+
+редиректы upstream — только same-origin (scheme + host + port), максимум 5 шагов,
+иначе `502`; `Location` path/query не попадает в лог.
 
 `Content-Encoding: gzip` и `deflate` декодируются и инспектируются. `br`, `zstd`
 и неизвестные кодировки в block-режиме дают `502` (проверить нельзя — не

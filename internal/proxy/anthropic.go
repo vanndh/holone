@@ -71,7 +71,7 @@ func (p *Proxy) streamAnthropic(w http.ResponseWriter, flusher http.Flusher, r *
 		return nil
 	}
 
-	_ = readSSE(r, onLine, onEvent)
+	_ = readSSE(r, onLine, onEvent, p.monitorOversized(st))
 	// Inspect any tool blocks that never received content_block_stop (truncation).
 	for _, si := range toolBuf {
 		st.add(si.Finish()...)
@@ -189,7 +189,28 @@ func (p *Proxy) streamAnthropicBlock(w http.ResponseWriter, flusher http.Flusher
 		return emit(ev.raw)
 	}
 
-	_ = readSSE(r, nil, onEvent)
+	// An uninspectable line cannot be safely rewritten, so fail closed: drop the
+	// buffered call, replace it with a safety note and close the turn with
+	// message_stop so the client does not hang waiting for the stream to end.
+	onOversized := func(ruleID string, n int) error {
+		st.add(oversizedSSEFinding(ruleID, n))
+		st.blocked = true
+		idx := bufIndex
+		if !buffering {
+			idx = 0
+		}
+		buffering = false
+		bufRaw, bufInspect = nil, nil
+		if e := emitAnthropicNote(w, flusher, idx, ruleID); e != nil {
+			return e
+		}
+		if e := emit(jsonFrame("message_stop", map[string]any{"type": "message_stop"})); e != nil {
+			return e
+		}
+		return errSSELineOversized
+	}
+
+	_ = readSSE(r, nil, onEvent, onOversized)
 	// A tool_use block left open at EOF (truncated stream) must still be
 	// inspected and resolved, or it would be both undetected and silently lost.
 	if buffering {

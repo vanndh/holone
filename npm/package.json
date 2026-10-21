@@ -1,0 +1,33 @@
+{
+  "name": "holone",
+  "version": "0.4.1",
+  "description": "Client-independent guard against malicious LLM API providers: inspects and blocks injected tool calls in LLM traffic.",
+  "license": "MIT",
+  "bin": {
+    "holone": "bin/holone.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin",
+    "install.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vanndh/holone.git"
+  },
+  "keywords": [
+    "llm",
+    "security",
+    "proxy",
+    "anthropic",
+    "openai",
+    "claude",
+    "prompt-injection"
+  ]
+}

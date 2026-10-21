@@ -61,6 +61,14 @@ const RuleAnomalyToolNameNotDeclared = "proto-tool-name-not-declared"
 // call is never forwarded.
 const RuleAnomalyOversizedToolCall = "proto-toolcall-oversized"
 
+// RuleAnomalyOversizedSSELine is the synthetic rule id used when a single SSE
+// line exceeds the parser's hard limit and cannot be inspected safely.
+const RuleAnomalyOversizedSSELine = "proto-sse-line-oversized"
+
+// RuleAnomalyOversizedSSEFrame is the synthetic rule id used when an SSE frame
+// (many lines without a blank-line separator) exceeds the frame cap.
+const RuleAnomalyOversizedSSEFrame = "proto-sse-frame-oversized"
+
 // RuleAnomalyEncodingUninspected is the synthetic rule id used when the
 // upstream used a Content-Encoding holone cannot decode: in monitor mode the
 // bytes are forwarded untouched, so the gap is surfaced as a finding.

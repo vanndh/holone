@@ -40,11 +40,13 @@ func (si *streamInspector) Write(s string) {
 	si.pending = append(si.pending, s...)
 	for len(si.pending) >= inspectWindow {
 		si.inspect(si.pending[:inspectWindow])
-		// Copy the overlap out of the inspected window: re-slicing in place
-		// would keep pinning a growing backing array and defeat the memory cap.
-		keep := make([]byte, inspectOverlap)
-		copy(keep, si.pending[inspectWindow-inspectOverlap:inspectWindow])
-		si.pending = keep
+		// Advance past the inspected window but keep the overlap, and do not
+		// drop the rest of the chunk that has not been windowed yet.
+		si.pending = si.pending[inspectWindow-inspectOverlap:]
+	}
+	// Do not pin a large chunk's backing array for the small tail that is left.
+	if cap(si.pending) > 2*inspectWindow {
+		si.pending = append([]byte(nil), si.pending...)
 	}
 }
 

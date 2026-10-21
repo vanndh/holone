@@ -160,7 +160,7 @@ func (p *Proxy) streamResponses(w http.ResponseWriter, flusher http.Flusher, r *
 		return nil
 	}
 
-	_ = readSSE(r, onLine, onEvent)
+	_ = readSSE(r, onLine, onEvent, p.monitorOversized(st))
 	for _, c := range calls {
 		st.add(c.insp.Finish()...)
 	}
@@ -177,6 +177,7 @@ func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher
 	calls := map[string]*responsesCall{}
 	text := newStreamInspector(p.cfg.Engine, "text")
 	dropped := false
+	terminated := false
 
 	emit := func(b []byte) error { return writeAndFlush(w, flusher, b) }
 
@@ -341,16 +342,33 @@ func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher
 		return emit(ev.raw)
 	}
 
-	_ = readSSE(r, nil, onEvent)
-	// Calls left open at EOF (truncated stream) must still be resolved.
+	// An uninspectable line cannot be safely parsed, so fail closed: withhold
+	// every pending call and terminate with the Responses error event.
+	onOversized := func(ruleID string, n int) error {
+		st.add(oversizedSSEFinding(ruleID, n))
+		st.blocked = true
+		dropped = true
+		terminated = true
+		calls = map[string]*responsesCall{}
+		if e := emit(responsesErrorFrame(ruleID)); e != nil {
+			return e
+		}
+		return errSSELineOversized
+	}
+
+	_ = readSSE(r, nil, onEvent, onOversized)
+	// Calls left open at EOF (truncated stream) must still be resolved, unless
+	// the stream was already terminated fail-closed.
 	keys := make([]string, 0, len(calls))
 	for k := range calls {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	for _, k := range keys {
-		if err := finalizeCall(calls[k]); err != nil {
-			break
+	if !terminated {
+		for _, k := range keys {
+			if err := finalizeCall(calls[k]); err != nil {
+				break
+			}
 		}
 	}
 	st.add(text.Finish()...)
