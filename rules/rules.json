@@ -1,12 +1,13 @@
 {
-  "version": 4,
-  "note": "Behavioral detection rules for malicious LLM-provider response injection. Patterns are Go RE2 regular expressions (no lookaround/backreferences). Each match against assistant text, tool_use input, or tool_call arguments produces a Finding. v4 adds: thinking-block injection detection (hidden instructions in extended thinking / signature fields), supply-chain attack vectors (typosquatting, dependency confusion, postinstall hooks), additional LOLBins (hh.exe, IEExec, IE4uInit, atbroker, pcwrun, cmd.exe pipe chains), hidden file/attribute manipulation, registry persistence beyond Run keys, kernel driver loading, cloud credential theft (Azure, GCP, Azure CLI, gcloud), additional exfil channels (Webhook.site, RequestBin, ngrok, cloudfront, pastebin), process injection/hollowing patterns, UAC bypass, and Windows Defender tampering. Severity guidance: 'high' = download+execute, anti-forensics, traffic hijack, LOLBin staging, client backdoor/hook injection, credential theft, known IOC, process injection, UAC bypass, supply-chain poisoning. 'medium' = dual-use actions (plain download, route/proxy/cron config, settings edits, paste upload, osascript) that warrant an alert but not auto-stripping. 'low' = weak signals. Community PRs welcome.",
+  "version": 5,
+  "note": "Behavioral detection rules for malicious LLM-provider response injection. Patterns are Go RE2 regular expressions (no lookaround/backreferences). Each match against assistant text, tool_use input, or tool_call arguments produces a Finding. v4 adds: thinking-block injection detection (hidden instructions in extended thinking / signature fields), supply-chain attack vectors (typosquatting, dependency confusion, postinstall hooks), additional LOLBins (hh.exe, IEExec, IE4uInit, atbroker, pcwrun, cmd.exe pipe chains), hidden file/attribute manipulation, registry persistence beyond Run keys, kernel driver loading, cloud credential theft (Azure, GCP, Azure CLI, gcloud), additional exfil channels (Webhook.site, RequestBin, ngrok, cloudfront, pastebin), process injection/hollowing patterns, UAC bypass, and Windows Defender tampering. Severity guidance: 'high' = download+execute, anti-forensics, traffic hijack, LOLBin staging, client backdoor/hook injection, credential theft, known IOC, process injection, UAC bypass, supply-chain poisoning. 'medium' = dual-use actions (plain download, route/proxy/cron config, settings edits, paste upload, osascript) that warrant an alert but not auto-stripping. 'low' = weak signals. Community PRs welcome. v5 adds optional per-rule `keywords`: when a match must contain one of the listed literals, the engine checks them with one lowercased pass and skips the regex when absent (detection output is unchanged).",
   "rules": [
     {
       "id": "dl-curl-pipe-sh",
       "category": "download-exec",
       "severity": "high",
       "pattern": "(?i)\\b(curl|wget)\\b[^|\\n]*\\|\\s*(sudo\\s+)?(ba)?sh\\b",
+      "keywords": ["curl", "wget"],
       "description": "Remote payload piped directly into a shell (curl ... | sh)"
     },
     {
@@ -14,6 +15,7 @@
       "category": "download-exec",
       "severity": "high",
       "pattern": "(?i)\\b(iwr|irm|curl|wget|invoke-webrequest|invoke-restmethod)\\b[^|\\n]*\\|\\s*(iex|invoke-expression)\\b",
+      "keywords": ["iwr", "irm", "curl", "wget", "invoke-webrequest", "invoke-restmethod"],
       "description": "Remote payload piped into Invoke-Expression (IWR ... | IEX)"
     },
     {
@@ -21,6 +23,7 @@
       "category": "download-exec",
       "severity": "medium",
       "pattern": "(?i)\\b(downloadstring|downloadfile|downloaddata)\\b",
+      "keywords": ["downloadstring", "downloadfile", "downloaddata"],
       "description": "WebClient.Download* call (download staging; medium because also used legitimately)"
     },
     {
@@ -28,6 +31,7 @@
       "category": "download-exec",
       "severity": "medium",
       "pattern": "(?i)\\b(system\\.)?net\\.webclient\\b",
+      "keywords": ["net.webclient"],
       "description": "Net.WebClient reference (download cradle, incl. reflection/string-concat invocation)"
     },
     {
@@ -35,6 +39,7 @@
       "category": "download-exec",
       "severity": "high",
       "pattern": "(?i)\\b(iex|invoke-expression)\\b[\\s\\S]{0,80}?new-object[\\s\\S]{0,40}?net\\.webclient",
+      "keywords": ["iex", "invoke-expression"],
       "description": "IEX(New-Object Net.WebClient) download cradle"
     },
     {
@@ -42,6 +47,7 @@
       "category": "download-exec",
       "severity": "high",
       "pattern": "(?i)\\bbitsadmin\\b[^\\n]*\\/transfer\\b|\\bstart-bitstransfer\\b",
+      "keywords": ["bitsadmin", "start-bitstransfer"],
       "description": "BITS used to fetch a remote file (LOLBin)"
     },
     {
@@ -49,6 +55,7 @@
       "category": "download-exec",
       "severity": "high",
       "pattern": "(?i)\\bcertutil\\b[^\\n]*\\b(-?urlcache|/urlcache|-split|/split|-verifyctl|/verifyctl|-decode|/decode)\\b",
+      "keywords": ["certutil"],
       "description": "certutil download/decode cradle (LOLBin staging)"
     },
     {
@@ -56,6 +63,7 @@
       "category": "download-exec",
       "severity": "medium",
       "pattern": "(?i)\\bregsvr32\\b[^\\n]*(/i:|http|\\.sct\\b)",
+      "keywords": ["regsvr32"],
       "description": "regsvr32 scriptlet / squiblydoo proxy execution"
     },
     {
@@ -63,6 +71,7 @@
       "category": "download-exec",
       "severity": "medium",
       "pattern": "(?i)\\b(wscript|cscript|mshta)\\b[^\\n]*\\.(vbs|js|hta)\\b|\\bmshta\\b[^\\n]*http",
+      "keywords": ["wscript", "cscript", "mshta"],
       "description": "Script host / mshta execution"
     },
     {
@@ -70,6 +79,7 @@
       "category": "download-exec",
       "severity": "medium",
       "pattern": "(?i)\\brundll32\\b[^\\n]*(javascript:|http)",
+      "keywords": ["rundll32"],
       "description": "rundll32 proxy execution"
     },
     {
@@ -84,6 +94,7 @@
       "category": "obfuscation",
       "severity": "high",
       "pattern": "(?i)\\bscriptblock\\b\\s*\\]?\\s*::\\s*create\\b",
+      "keywords": ["scriptblock"],
       "description": "Dynamic code execution via ScriptBlock::Create (IEX substitute)"
     },
     {
@@ -98,6 +109,7 @@
       "category": "obfuscation",
       "severity": "low",
       "pattern": "(?i)\\bfrombase64string\\b",
+      "keywords": ["frombase64string"],
       "description": "Base64 decode (weak signal; common in benign code)"
     },
     {
@@ -105,6 +117,7 @@
       "category": "obfuscation",
       "severity": "medium",
       "pattern": "(?i)-w(indowstyle)?\\s+hidden\\b",
+      "keywords": ["hidden"],
       "description": "Hidden window style (stealth execution)"
     },
     {
@@ -112,6 +125,7 @@
       "category": "obfuscation",
       "severity": "medium",
       "pattern": "(?i)\\binvoke-expression\\b|\\biex\\s*\\(|\\|\\s*iex\\b|\\biex\\s+[\"'$]",
+      "keywords": ["invoke-expression", "iex"],
       "description": "Invoke-Expression of dynamic content (excludes the Elixir 'iex' REPL)"
     },
     {
@@ -119,6 +133,7 @@
       "category": "persistence",
       "severity": "high",
       "pattern": "(?i)\\bschtasks\\b[^\\n]*\\/create\\b",
+      "keywords": ["schtasks"],
       "description": "Scheduled task creation (persistence)"
     },
     {
@@ -126,6 +141,7 @@
       "category": "persistence",
       "severity": "high",
       "pattern": "(?i)\\b(register|new)-scheduledtask\\b",
+      "keywords": ["scheduledtask"],
       "description": "PowerShell scheduled task registration (persistence)"
     },
     {
@@ -133,6 +149,7 @@
       "category": "persistence",
       "severity": "high",
       "pattern": "(?i)\\bschedule\\.service\\b|\\bregistertaskdefinition\\b",
+      "keywords": ["schedule.service", "registertaskdefinition"],
       "description": "Scheduled-task persistence via COM (Schedule.Service)"
     },
     {
@@ -140,6 +157,7 @@
       "category": "persistence",
       "severity": "medium",
       "pattern": "(?i)currentversion\\\\\\\\?run(once)?\\b|\\breg\\b\\s+add\\b[^\\n]*\\brun(once)?\\b",
+      "keywords": ["currentversion", "reg"],
       "description": "Registry Run key autostart (dual-use: also legitimate self-startup)"
     },
     {
@@ -147,6 +165,7 @@
       "category": "persistence",
       "severity": "medium",
       "pattern": "(?i)/etc/cron\\.(d|daily|hourly|weekly|monthly)/|/var/spool/cron/|\\bcrontab\\b[^\\n]*(curl|wget|http|/tmp/|base64|\\|\\s*sh)",
+      "keywords": ["/etc/cron.", "/var/spool/cron/", "crontab"],
       "description": "cron persistence with a fetch/temp/pipe indicator (Linux)"
     },
     {
@@ -154,6 +173,7 @@
       "category": "persistence",
       "severity": "medium",
       "pattern": "(?i)launchagents|launchdaemons|launchctl\\s+load",
+      "keywords": ["launchagents", "launchdaemons", "launchctl"],
       "description": "launchd persistence (macOS)"
     },
     {
@@ -161,6 +181,7 @@
       "category": "network",
       "severity": "high",
       "pattern": "(?i)\\btun2socks\\b",
+      "keywords": ["tun2socks"],
       "description": "tun2socks (transparent traffic redirection through a proxy)"
     },
     {
@@ -168,6 +189,7 @@
       "category": "network",
       "severity": "high",
       "pattern": "(?i)\\bsocks[45]?[ah]?:\\/\\/",
+      "keywords": ["socks"],
       "description": "SOCKS proxy endpoint reference (incl. socks5h / socks4a)"
     },
     {
@@ -175,6 +197,7 @@
       "category": "network",
       "severity": "low",
       "pattern": "(?i)\\broute\\b\\s+(-p\\s+)?(add|change)\\b|\\bip\\b\\s+route\\s+add\\b",
+      "keywords": ["route"],
       "description": "Routing table manipulation (weak/dual-use signal)"
     },
     {
@@ -182,6 +205,7 @@
       "category": "network",
       "severity": "low",
       "pattern": "(?i)\\b(new|set)-netroute\\b",
+      "keywords": ["netroute"],
       "description": "Routing-table change via PowerShell cmdlet (weak/dual-use signal)"
     },
     {
@@ -189,6 +213,7 @@
       "category": "network",
       "severity": "high",
       "pattern": "(?i)disable-netadapterbinding\\b[^\\n]*(ms_tcpip6|ipv6)|\\bdisabledcomponents\\b|tcpip6\\\\\\\\parameters|set-netadapterbinding\\b[^\\n]*-enabled\\s+\\$?false",
+      "keywords": ["disable-netadapterbinding", "set-netadapterbinding", "disabledcomponents", "tcpip6"],
       "description": "Disabling IPv6 (proxy leak prevention)"
     },
     {
@@ -196,6 +221,7 @@
       "category": "network",
       "severity": "high",
       "pattern": "(?i)\\bset-dnsclientserveraddress\\b|netsh\\b[^\\n]*\\binterface\\b[^\\n]*\\b(set|add)\\b[^\\n]*\\bdns",
+      "keywords": ["set-dnsclientserveraddress", "netsh"],
       "description": "DNS server override (traffic redirection)"
     },
     {
@@ -203,6 +229,7 @@
       "category": "network",
       "severity": "high",
       "pattern": "(?i)netsh\\b[^\\n]*winhttp[^\\n]*proxy|\\bset-itemproperty\\b[^\\n]*proxyserver|internet\\s*settings[^\\n]*proxyenable|\\bautoconfigurl\\b|\\b(https?_proxy|all_proxy)\\b\\s*=",
+      "keywords": ["netsh", "set-itemproperty", "internet", "autoconfigurl", "proxy"],
       "description": "System-wide HTTP/SOCKS proxy configuration"
     },
     {
@@ -210,6 +237,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)\\bclear-eventlog\\b",
+      "keywords": ["clear-eventlog"],
       "description": "Clearing Windows event logs"
     },
     {
@@ -217,6 +245,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)\\bwevtutil\\b\\s+cl\\b|\\bwevtutil\\b[^\\n]*\\bclear-log\\b",
+      "keywords": ["wevtutil"],
       "description": "Clearing event logs via wevtutil"
     },
     {
@@ -224,6 +253,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)\\bclear-history\\b|consolehost_history|historysavepath|set-psreadlineoption[^\\n]*savenothing|psreadline[\\s\\S]{0,60}(remove|clear|savenothing|delete)",
+      "keywords": ["clear-history", "consolehost_history", "historysavepath", "psreadline"],
       "description": "Wiping PowerShell command history"
     },
     {
@@ -231,6 +261,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)enablescriptblocklogging[^\\n]{0,20}(0|\\$?false)|(disable|remove|stop)[^\\n]{0,30}scriptblocklogging|\\b(add|set)-mppreference\\b[^\\n]*(-exclusion|disable)",
+      "keywords": ["scriptblocklogging", "mppreference"],
       "description": "Disabling PowerShell ScriptBlock logging / adding Defender exclusion"
     },
     {
@@ -238,6 +269,7 @@
       "category": "locale",
       "severity": "medium",
       "pattern": "(?i)set-winuilanguageoverride|set-winuserlanguagelist|set-winsystemlocale|set-culture",
+      "keywords": ["set-winuilanguageoverride", "set-winuserlanguagelist", "set-winsystemlocale", "set-culture"],
       "description": "System locale/language manipulation (anti-attribution)"
     },
     {
@@ -245,6 +277,7 @@
       "category": "client-config",
       "severity": "medium",
       "pattern": "(?i)(set-content|out-file|add-content|tee-object|cat\\s*>|>\\s*)[\\s\\S]{0,80}(\\.claude/(settings|settings\\.local)\\.json|~/\\.claude\\.json|\\$HOME/\\.claude\\.json)",
+      "keywords": [".claude"],
       "description": "Rewrite of a Claude Code client settings file (.claude/settings.json or ~/.claude.json) — persistent client-side configuration tampering"
     },
     {
@@ -252,6 +285,7 @@
       "category": "client-config",
       "severity": "medium",
       "pattern": "(?i)(mcp_servers|mcpServers|\\.mcp\\.json|\\.cursor/mcp\\.json)[\\s\\S]{0,120}(npx|uvx|node\\s|python\\s|\"command\"|args\\s*:|command\\s*:)",
+      "keywords": ["mcp_servers", "mcpservers", ".mcp.json", ".cursor/mcp.json"],
       "description": "MCP server entry injected into a client MCP config (npx/uvx/node/python command runner) — adds a tool surface the provider controls"
     },
     {
@@ -259,6 +293,7 @@
       "category": "client-config",
       "severity": "high",
       "pattern": "(?i)(PreToolUse|PostToolUse|UserPromptSubmit|Stop|Notification|\"hooks\")[\\s\\S]{0,120}(\\.claude/(settings|settings\\.local)\\.json|~/\\.claude\\.json|\\.claude/hooks)",
+      "keywords": ["pretooluse", "posttooluse", "userpromptsubmit", "stop", "notification", "\"hooks\""],
       "description": "Client lifecycle hook (PreToolUse/PostToolUse/Stop) injected into settings — runs arbitrary commands on every tool call or session end"
     },
     {
@@ -266,6 +301,7 @@
       "category": "client-config",
       "severity": "high",
       "pattern": "(?i)(curl|wget|iex|invoke-expression|http[s]?://|base64|/bin/sh|powershell)[\\s\\S]{0,120}\\b(CLAUDE|AGENTS)\\.md\\b|\\b(CLAUDE|AGENTS)\\.md\\b[\\s\\S]{0,120}(curl|wget|iex|invoke-expression|http[s]?://|base64|/bin/sh|powershell)|\\.cursorrules[\\s\\S]{0,120}(curl|wget|http[s]?://|base64|/bin/sh)",
+      "keywords": ["claude.md", "agents.md", ".cursorrules"],
       "description": "Persistent prompt-injection written to an AI client instruction file (CLAUDE.md/AGENTS.md/.cursorrules) carrying a payload indicator"
     },
     {
@@ -273,6 +309,7 @@
       "category": "credential-theft",
       "severity": "high",
       "pattern": "(?i)(cat|get-content|type|cp|copy|curl|slurp|send|upload)\\b[\\s\\S]{0,40}~/\\.ssh/id_(rsa|ed25519|ecdsa|dsa)(\\s|$|['\";,/|&)])",
+      "keywords": ["~/.ssh/id_"],
       "description": "Read or copy of an SSH private key (~/.ssh/id_rsa / id_ed25519 / id_ecdsa / id_dsa)"
     },
     {
@@ -280,6 +317,7 @@
       "category": "credential-theft",
       "severity": "high",
       "pattern": "(?i)(cat|get-content|type|cp|copy|curl|send|upload)\\b[\\s\\S]{0,40}~/\\.aws/credentials|/\\.aws/credentials\\b",
+      "keywords": [".aws/credentials"],
       "description": "Read of the AWS credentials file (~/.aws/credentials)"
     },
     {
@@ -287,6 +325,7 @@
       "category": "credential-theft",
       "severity": "high",
       "pattern": "(?i)(cat|get-content|type|cp|copy|curl|send|upload)\\b[\\s\\S]{0,40}~/\\.kube/config|/\\.kube/config\\b",
+      "keywords": ["/.kube/config"],
       "description": "Read of the Kubernetes kubeconfig (~/.kube/config) — cluster credentials"
     },
     {
@@ -294,6 +333,7 @@
       "category": "credential-theft",
       "severity": "high",
       "pattern": "(?i)(cat|get-content|type|cp|copy|curl)\\b[\\s\\S]{0,40}~/\\.docker/config\\.json",
+      "keywords": ["/.docker/config.json"],
       "description": "Read of the Docker config (~/.docker/config.json) — registry tokens"
     },
     {
@@ -301,6 +341,7 @@
       "category": "credential-theft",
       "severity": "high",
       "pattern": "(?i)(cat|get-content|type|cp|copy|curl)\\b[\\s\\S]{0,40}~/\\.netrc\\b",
+      "keywords": ["/.netrc"],
       "description": "Read of ~/.netrc — FTP/HTTP stored credentials"
     },
     {
@@ -308,6 +349,7 @@
       "category": "credential-theft",
       "severity": "medium",
       "pattern": "(?i)(cat|get-content|type|cp|copy)\\b[\\s\\S]{0,30}\\.env(\\.(local|prod|production|development|test|staging))?($|[\\s\"';|&)=])",
+      "keywords": [".env"],
       "description": "Read of a .env / .env.local / .env.production file — application secrets (dual-use: also legitimate in dev)"
     },
     {
@@ -315,6 +357,7 @@
       "category": "credential-theft",
       "severity": "high",
       "pattern": "(?i)(Login Data|Cookies|Local State|Web Data|History)\\b[\\s\\S]{0,80}(Chrome|Google\\\\Chrome|AppData|Application Support)|/Google/Chrome/[^\\n]*(Login Data|Cookies|Local State|Web Data)",
+      "keywords": ["login data", "cookies", "local state", "web data", "history", "/google/chrome/"],
       "description": "Access to Chrome browser credential/cookie stores (Login Data / Cookies / Local State / Web Data)"
     },
     {
@@ -322,6 +365,7 @@
       "category": "credential-theft",
       "severity": "medium",
       "pattern": "(?i)git\\s+credential\\s+(fill|cache|approve|store)\\b",
+      "keywords": ["credential"],
       "description": "git credential helper invocation to harvest stored git credentials"
     },
     {
@@ -329,6 +373,7 @@
       "category": "exfil",
       "severity": "high",
       "pattern": "(?i)discord\\.com/api/webhooks/\\d+/[A-Za-z0-9_-]+",
+      "keywords": ["discord.com/api/webhooks/"],
       "description": "Discord webhook URL — common exfiltration channel that resolves to a legit domain, bypassing domain blocklists"
     },
     {
@@ -336,6 +381,7 @@
       "category": "exfil",
       "severity": "high",
       "pattern": "(?i)api\\.telegram\\.org/bot[0-9]+:[A-Za-z0-9_-]+/(send(message|document|file|photo|audio|video|sticker)|forwardmessage|getfile|editmessage)",
+      "keywords": ["api.telegram.org/bot"],
       "description": "Telegram Bot API send/forward call — exfiltration over a whitelisted domain"
     },
     {
@@ -343,6 +389,7 @@
       "category": "exfil",
       "severity": "high",
       "pattern": "(?i)hooks\\.slack\\.com/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]{16,}",
+      "keywords": ["hooks.slack.com/services/"],
       "description": "Slack incoming-webhook URL — exfiltration channel on a whitelisted domain"
     },
     {
@@ -350,6 +397,7 @@
       "category": "exfil",
       "severity": "medium",
       "pattern": "(?i)(curl|wget)\\b[\\s\\S]{0,40}\\b(0x0\\.st|transfer\\.sh|paste\\.sh|paste\\.ee|paste\\.rs|ix\\.io|sprunge\\.us|dpaste\\.(org|com)|hastebin|ghostbin|ptpb\\.pb)\\b",
+      "keywords": ["0x0.st", "transfer.sh", "paste.sh", "paste.ee", "paste.rs", "ix.io", "sprunge.us", "dpaste.org", "dpaste.com", "hastebin", "ghostbin", "ptpb.pb"],
       "description": "Upload to an anonymous paste/transfer service (0x0.st, transfer.sh, paste.* ) — dual-use, but a classic exfil endpoint"
     },
     {
@@ -357,6 +405,7 @@
       "category": "exfil",
       "severity": "high",
       "pattern": "(?i)\\b(nslookup|dig)\\b[\\s\\S]{0,20}(\\$\\(|`)",
+      "keywords": ["nslookup", "dig"],
       "description": "DNS resolver fed command-substitution output (nslookup $(...) / dig `...`) — DNS-tunnel exfiltration pattern"
     },
     {
@@ -364,6 +413,7 @@
       "category": "exfil",
       "severity": "high",
       "pattern": "(?i)\\bdnscat2?\\b",
+      "keywords": ["dnscat"],
       "description": "dnscat2 DNS tunneling tool"
     },
     {
@@ -371,6 +421,7 @@
       "category": "download-exec",
       "severity": "high",
       "pattern": "(?i)\\bmsiexec\\b[^\\n]*(/i\\b[^\\n]*http|/q[^\\n]*/i\\b|/quiet[^\\n]*/i\\b|/passive[^\\n]*/i\\b)",
+      "keywords": ["msiexec"],
       "description": "msiexec installs a remote/silent MSI package (LOLBin download+execute)"
     },
     {
@@ -378,6 +429,7 @@
       "category": "download-exec",
       "severity": "medium",
       "pattern": "(?i)\\b(installutil|regasm|regsvcs)\\b[^\\n]*(/u\\b|http|\\.dll\\b|logfile)",
+      "keywords": ["installutil", "regasm", "regsvcs"],
       "description": ".NET LOLBin (InstallUtil/Regasm/Regsvcs) proxy execution of an assembly"
     },
     {
@@ -385,6 +437,7 @@
       "category": "download-exec",
       "severity": "high",
       "pattern": "(?i)\\bforfiles\\b[^\\n]*/c\\b[^\\n]*(cmd|powershell|cscript|wscript|sh\\b)",
+      "keywords": ["forfiles"],
       "description": "forfiles /c launching an arbitrary interpreter (LOLBin execution)"
     },
     {
@@ -392,6 +445,7 @@
       "category": "download-exec",
       "severity": "high",
       "pattern": "(?i)\\bwmic\\b[^\\n]*process\\s+call\\s+create\\b",
+      "keywords": ["wmic"],
       "description": "wmic process call create — arbitrary process launch via WMI"
     },
     {
@@ -399,6 +453,7 @@
       "category": "obfuscation",
       "severity": "medium",
       "pattern": "(?i)\\badd-type\\b[^\\n]*(Assembly|Type|namespace|using\\s+System|DllImport|public\\s+class|System\\.Reflection)",
+      "keywords": ["add-type"],
       "description": "Add-Type compiling inline C# (dual-use interop, but also the standard AMSI-bypass / in-memory payload loader)"
     },
     {
@@ -406,6 +461,7 @@
       "category": "download-exec",
       "severity": "medium",
       "pattern": "(?i)\\bosascript\\b[\\s\\S]{0,80}do\\s+shell\\s+script",
+      "keywords": ["osascript"],
       "description": "osascript do shell script — macOS AppleScript arbitrary shell execution"
     },
     {
@@ -413,6 +469,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)amsiInitFailed|AmsiUtils|\\[Ref\\]\\.Assembly\\.GetType|\\bamsi\\b[\\s\\S]{0,40}(bypass|fail|\\$null|setvalue|patch)",
+      "keywords": ["amsi", "[ref].assembly.gettype"],
       "description": "AMSI bypass (amsiInitFailed / AmsiUtils reflection / patching) — disabling content scanning before payload"
     },
     {
@@ -420,6 +477,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)EtwEventWrite|PatchEventWrite|\\bETW\\b[\\s\\S]{0,40}(patch|bypass|null|unhook)",
+      "keywords": ["etweventwrite", "patcheventwrite", "etw"],
       "description": "ETW patching / EventWrite hooking — blinding telemetry before payload execution"
     },
     {
@@ -427,6 +485,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)ExecutionContext\\.SessionState\\.LanguageMode|LanguageMode\\b[\\s\\S]{0,20}(Full|Constrained|Bypass)",
+      "keywords": ["languagemode"],
       "description": "PowerShell Constrained Language Mode bypass — escaping a sandbox restriction"
     },
     {
@@ -434,6 +493,7 @@
       "category": "git-attack",
       "severity": "high",
       "pattern": "(?i)git\\s+config\\b[^\\n]*core\\.hooksPath",
+      "keywords": ["core.hookspath"],
       "description": "git config core.hooksPath — redirecting git hooks to an attacker-controlled directory"
     },
     {
@@ -441,6 +501,7 @@
       "category": "git-attack",
       "severity": "medium",
       "pattern": "(?i)git\\s+remote\\b[^\\n]*set-url\\b[^\\n]*http[s]?://",
+      "keywords": ["set-url"],
       "description": "git remote set-url pointing at an HTTP(S) endpoint — remote hijack for push-exfil or supply-chain injection (dual-use)"
     },
     {
@@ -448,6 +509,7 @@
       "category": "git-attack",
       "severity": "high",
       "pattern": "(?i)\\.git/hooks/[A-Za-z][A-Za-z0-9._-]*[\\s\\S]{0,60}(set-content|out-file|tee-object|cat\\s*>|>\\s*|echo\\b|chmod\\s+\\+x)",
+      "keywords": [".git/hooks/"],
       "description": "Writing a file into .git/hooks/ — git hook persistence (pre-commit/pre-push/pre-rebase)"
     },
     {
@@ -455,6 +517,7 @@
       "category": "git-attack",
       "severity": "high",
       "pattern": "(?i)\\.github/workflows/[A-Za-z0-9_.-]+\\.ya?ml[\\s\\S]{0,150}(curl|wget|iex|invoke-expression|http[s]?://|run:|bash|/bin/sh)",
+      "keywords": [".github/workflows/"],
       "description": "GitHub Actions workflow file carrying a fetch/exec payload — CI supply-chain poisoning"
     },
     {
@@ -462,6 +525,7 @@
       "category": "persistence",
       "severity": "medium",
       "pattern": "(?i)defaults\\s+write\\b[^\\n]*loginwindow|osascript[^\\n]*Login\\s+Items",
+      "keywords": ["defaults", "osascript"],
       "description": "macOS Login Items persistence via defaults / osascript"
     },
     {
@@ -469,6 +533,7 @@
       "category": "persistence",
       "severity": "medium",
       "pattern": "(?i)launchctl\\s+(bootstrap|load\\s+-w|enable\\b)",
+      "keywords": ["launchctl"],
       "description": "launchctl bootstrap/load — loading a persistent launchd agent/daemon (macOS)"
     },
     {
@@ -476,6 +541,7 @@
       "category": "persistence",
       "severity": "medium",
       "pattern": "(?i)systemd-run\\b[\\s\\S]{0,40}(curl|wget|http|bash|/bin/sh)|/etc/systemd/system/[A-Za-z0-9._-]+\\.service[\\s\\S]{0,120}(curl|wget|http|exec|bash|/bin/|powershell)",
+      "keywords": ["systemd"],
       "description": "systemd unit file / systemd-run carrying a fetch/exec payload — Linux persistence (scoped: plain 'systemctl enable nginx' is NOT matched)"
     },
     {
@@ -483,6 +549,7 @@
       "category": "network",
       "severity": "high",
       "pattern": "(?i)docker\\s+run\\b[^\\n]*(--privileged|--pid=host|--net=host|-v\\s+/:/|-v\\s+/:[A-Za-z]+|--add-host|--cgroupns=host)",
+      "keywords": ["docker"],
       "description": "docker run with host-escape flags (--privileged / --pid=host / -v /:/ ) — container breakout"
     },
     {
@@ -490,6 +557,7 @@
       "category": "persistence",
       "severity": "medium",
       "pattern": "(?i)\\bwsl\\b[^\\n]*(--exec|-e\\b|bash\\s+-c|cmd\\s+/c|/bin/sh)",
+      "keywords": ["wsl"],
       "description": "WSL invocation to pivot into the Linux subsystem — bypassing Windows-side checks (dual-use)"
     },
     {
@@ -497,6 +565,7 @@
       "category": "persistence",
       "severity": "high",
       "pattern": "(?i)~/\\.npmrc[\\s\\S]{0,60}(registry|http)|npm\\s+config\\s+set\\s+registry\\b",
+      "keywords": ["/.npmrc", "npm"],
       "description": "~/.npmrc / npm config registry override — redirecting package installs to a malicious registry (supply-chain persistence)"
     },
     {
@@ -504,6 +573,7 @@
       "category": "persistence",
       "severity": "high",
       "pattern": "(?i)pip\\s+config\\s+set\\s+(global\\.)?index-url|~/\\.pip/pip\\.conf[\\s\\S]{0,40}index-url|pip\\.ini[\\s\\S]{0,40}index-url",
+      "keywords": ["pip"],
       "description": "pip index-url override — redirecting Python package installs to a malicious index"
     },
     {
@@ -511,6 +581,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)(>\\s*/var/log/|rm\\b[^\\n]*/var/log/|journalctl\\s+--vacuum|shred\\b[^\\n]*/var/log/|/dev/null\\s*>\\s*/var/log/)",
+      "keywords": ["/var/log/", "journalctl"],
       "description": "Linux log file wiping (rm/journalctl --vacuum/shred / redirect on /var/log)"
     },
     {
@@ -518,6 +589,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)unset\\s+HISTFILE|history\\s+-c|/dev/null\\s*>\\s*~/\\.bash_history|shred\\b[^\\n]*~/\\.bash_history|>\\s*~/\\.bash_history|rm\\b[^\\n]*~/\\.\\w*history",
+      "keywords": ["histfile", "history"],
       "description": "Linux shell history wiping (unset HISTFILE / history -c / shred / redirect on ~/.bash_history)"
     },
     {
@@ -525,6 +597,7 @@
       "category": "persistence",
       "severity": "high",
       "pattern": "(?i)(\\.bashrc|\\.zshrc|\\.profile|\\.bash_profile|\\.zprofile)[\\s\\S]{0,120}(curl|wget|iex|invoke-expression|http[s]?://|base64|\\bnc\\b|bash\\s+-i|/dev/tcp/|/bin/sh)",
+      "keywords": [".bashrc", ".zshrc", ".profile", ".bash_profile", ".zprofile"],
       "description": "Shell RC/profile file carrying a fetch/exec payload — persistent execution on every new shell (Linux/macOS)"
     },
     {
@@ -532,6 +605,7 @@
       "category": "client-config",
       "severity": "high",
       "pattern": "(?i)\"thinking\"[\\s\\S]{0,160}(curl|wget|iex|invoke-expression|schtasks|powershell|cmd\\.exe|\\|\\s*sh\\b|downloaded|executed|/bin/bash|npx|uvx)",
+      "keywords": ["\"thinking\""],
       "description": "Hidden instruction embedded in an LLM thinking/redacted_thinking block — bypasses user visibility"
     },
     {
@@ -539,6 +613,7 @@
       "category": "client-config",
       "severity": "medium",
       "pattern": "(?i)\"signature\"\\s*:\\s*\"[^\"]{200,}",
+      "keywords": ["\"signature\""],
       "description": "Abnormally large signature field in streaming response — potential steganographic payload channel"
     },
     {
@@ -546,6 +621,7 @@
       "category": "supply-chain",
       "severity": "high",
       "pattern": "(?i)\\b(npm\\s+install|pip\\s+install|pip3\\s+install|gem\\s+install|cargo\\s+install|go\\s+install)\\b[\\s\\S]{0,40}(https?://|[A-Za-z]+-[A-Za-z]+-[A-Za-z]+|evil|backdoor|stealth|hidden|trojan|inject)",
+      "keywords": ["install"],
       "description": "Package install from a suspicious source or with typosquatting-like compound name — supply-chain injection"
     },
     {
@@ -553,6 +629,7 @@
       "category": "supply-chain",
       "severity": "high",
       "pattern": "(?i)\"postinstall\"\\s*:\\s*\"[^\"]*(curl|wget|nc\\s|nslookup|base64|\\$\\()",
+      "keywords": ["\"postinstall\""],
       "description": "npm package.json postinstall script with a fetch/exec/exfil payload — runs on install without user action"
     },
     {
@@ -560,6 +637,7 @@
       "category": "supply-chain",
       "severity": "high",
       "pattern": "(?i)(npm\\s+config\\s+set\\s+@[a-z]+:registry|pip\\s+config\\s+set\\s+extra-index-url|\\bregistry\\b[\\s\\S]{0,40}(evil|backdoor|steal|leak|malware|inject))",
+      "keywords": ["npm", "pip", "registry"],
       "description": "Package manager extra-index/scope registry pointing at a suspicious host — dependency confusion attack"
     },
     {
@@ -567,6 +645,7 @@
       "category": "download-exec",
       "severity": "high",
       "pattern": "(?i)\\bhh\\.exe\\b[^\\n]*\\.(chm|ms-its|http)",
+      "keywords": ["hh.exe"],
       "description": "hh.exe downloading/opening a remote CHM — HTML Help LOLBin"
     },
     {
@@ -574,6 +653,7 @@
       "category": "download-exec",
       "severity": "high",
       "pattern": "(?i)\\b(IEExec|IEEXEC)\\.exe\\b[^\\n]*http",
+      "keywords": ["ieexec"],
       "description": "IEExec loading a remote assembly — .NET LOLBin download+execute"
     },
     {
@@ -581,6 +661,7 @@
       "category": "download-exec",
       "severity": "medium",
       "pattern": "(?i)\\batbroker\\.exe\\b",
+      "keywords": ["atbroker.exe"],
       "description": "atbroker.exe — AT Broker accessibility-helper LOLBin (often used for UAC bypass)"
     },
     {
@@ -588,6 +669,7 @@
       "category": "download-exec",
       "severity": "medium",
       "pattern": "(?i)\\bpcwrun\\.exe\\b",
+      "keywords": ["pcwrun.exe"],
       "description": "pcwrun.exe — Program Compatibility Wizard runner LOLBin"
     },
     {
@@ -595,6 +677,7 @@
       "category": "download-exec",
       "severity": "medium",
       "pattern": "(?i)\\bcmd\\.exe\\b[^\\n]{0,60}/c\\b[^\\n]{0,60}\\|\\|?[^\\n]{0,60}\\b(curl|wget|powershell|net\\s+user|whoami|ipconfig|systeminfo|reg\\s+add)",
+      "keywords": ["cmd.exe"],
       "description": "cmd.exe pipe chain with staging/recon commands — multi-stage LOLBin chain"
     },
     {
@@ -602,6 +685,7 @@
       "category": "anti-forensics",
       "severity": "medium",
       "pattern": "(?i)\\battrib(\\.exe)?\\s*\\+[hsr]\\b|\\bset-itemproperty\\b[\\s\\S]{0,60}\\battributes\\b[\\s\\S]{0,40}\\bhidden\\b|\\bchflags\\b[^\\n]*\\bhidden\\b",
+      "keywords": ["attrib", "set-itemproperty", "chflags"],
       "description": "Setting hidden/system file attributes — stealth/anti-forensics"
     },
     {
@@ -609,6 +693,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)\\bads\\b|alternate\\s*data\\s*stream|:\\$data\\b|\\btype\\b[^\\n]*>\\s*[^\\n]*:",
+      "keywords": ["ads", "alternate", "$data", "type"],
       "description": "NTFS Alternate Data Stream manipulation — hiding payloads in ADS"
     },
     {
@@ -616,6 +701,7 @@
       "category": "persistence",
       "severity": "medium",
       "pattern": "(?i)\\b(RunOnceEx|RunServices|RunServicesOnce|AppInit_DLLs|AppCertDlls|IFEO|Image\\s+File\\s+Execution\\s+Options|Active\\s+Setup|Installed\\s+Components|Winlogon\\\\Shell|Winlogon\\\\Userinit|Winlogon\\\\Notify|BootExecute|Session\\s+Manager\\\\PendingFileRenameOperations)",
+      "keywords": ["runonceex", "runservices", "appinit_dlls", "appcertdlls", "ifeo", "winlogon", "bootexecute", "image", "active", "installed", "session"],
       "description": "Alternative registry persistence keys beyond standard Run/RunOnce"
     },
     {
@@ -623,6 +709,7 @@
       "category": "persistence",
       "severity": "high",
       "pattern": "(?i)\\bsc\\.exe?\\s+create\\b[^\\n]*\\btype=\\s*kernel\\b|\\bNew-Service\\b[\\s\\S]{0,40}KernelDriver|\\bDriverStore|\\\\.sys\\b[\\s\\S]{0,40}\\bsc\\.exe?\\s+start\\b",
+      "keywords": ["kernel", "driverstore", "sc.ex"],
       "description": "Kernel driver loading (sc.exe type=kernel / New-Service KernelDriver) — ring-0 persistence"
     },
     {
@@ -630,6 +717,7 @@
       "category": "credential-theft",
       "severity": "high",
       "pattern": "(?i)(cat|get-content|type|cp|copy|curl|slurp|send|upload)\\b[\\s\\S]{0,40}(~/[.]azure/|az\\s+login[^\\n]*-p|C:\\\\Users\\\\[^\\\\]+\\\\[.]azure\\\\)",
+      "keywords": [".azure", "login"],
       "description": "Read of Azure credentials (~/.azure/ directory or az login with password)"
     },
     {
@@ -637,6 +725,7 @@
       "category": "credential-theft",
       "severity": "high",
       "pattern": "(?i)(cat|get-content|type|cp|copy|curl|slurp|send|upload)\\b[\\s\\S]{0,40}(~/\\.config/gcloud/|GOOGLE_APPLICATION_CREDENTIALS|gcloud\\s+auth\\s+print-access-token)",
+      "keywords": [".config/gcloud", "google_application_credentials", "gcloud"],
       "description": "Read of GCP credentials (~/.config/gcloud/ or gcloud token extraction)"
     },
     {
@@ -644,6 +733,7 @@
       "category": "exfil",
       "severity": "medium",
       "pattern": "(?i)\\b(webhook\\.site|requestbin|requestcatcher|pipedream|beeceptor|mockapi|ngrok|localtunnel\\.me|pagekite|serveo\\.net|dataplicity|youshallnotpass|pythonanywhere\\.com)\\b",
+      "keywords": ["webhook.site", "requestbin", "requestcatcher", "pipedream", "beeceptor", "mockapi", "ngrok", "localtunnel.me", "pagekite", "serveo.net", "dataplicity", "youshallnotpass", "pythonanywhere.com"],
       "description": "Request to an ephemeral webhook/request-capture service — common exfil target"
     },
     {
@@ -651,6 +741,7 @@
       "category": "exfil",
       "severity": "medium",
       "pattern": "(?i)\\bcloudfront\\.net\\b[\\s\\S]{0,40}(dns|exfil|tunnel|beacon|checkin|register|upload|send|report)",
+      "keywords": ["cloudfront.net"],
       "description": "CloudFront distribution with exfil/beacon-style query — C2 over CDN"
     },
     {
@@ -658,6 +749,7 @@
       "category": "exfil",
       "severity": "medium",
       "pattern": "(?i)(curl|wget)\\b[\\s\\S]{0,40}\\b(pastebin\\.com|paste\\.(ee|rs|sh)|iv\\.paste|justpaste\\.it|rentry\\.co|codeshare\\.io|dpaste)\\b",
+      "keywords": ["pastebin.com", "paste.ee", "paste.rs", "paste.sh", "iv.paste", "justpaste.it", "rentry.co", "codeshare.io", "dpaste"],
       "description": "Upload to a pastebin-style service — data exfiltration (dual-use)"
     },
     {
@@ -665,6 +757,7 @@
       "category": "obfuscation",
       "severity": "high",
       "pattern": "(?i)(CreateRemoteThread|WriteProcessMemory|VirtualAllocEx|NtCreateThreadEx|QueueUserAPC|SetThreadContext|ZwUnmapViewOfSection|PROCESS_CREATE_THREAD|PROCESS_VM_WRITE|PROCESS_VM_OPERATION)",
+      "keywords": ["createremotethread", "writeprocessmemory", "virtualallocex", "ntcreatethreadex", "queueuserapc", "setthreadcontext", "zwunmapviewofsection", "process_create_thread", "process_vm_write", "process_vm_operation"],
       "description": "Process injection / hollowing API calls (CreateRemoteThread / WriteProcessMemory / QueueUserAPC)"
     },
     {
@@ -672,6 +765,7 @@
       "category": "obfuscation",
       "severity": "high",
       "pattern": "(?i)(ReflectiveLoader|ManualMap|MemoryModule|RunPE|PE\\s+Injection)",
+      "keywords": ["reflectiveloader", "manualmap", "memorymodule", "runpe", "injection"],
       "description": "Reflective DLL loading or manual map / RunPE — fileless in-memory loading"
     },
     {
@@ -679,6 +773,7 @@
       "category": "obfuscation",
       "severity": "high",
       "pattern": "(?i)(VirtualProtect\\b[\\s\\S]{0,60}\\b(PAGE_EXECUTE_READWRITE|0x40)\\b|\\bWriteProcessMemory\\b[\\s\\S]{0,60}\\bCreateRemoteThread\\b|\\bGetDelegateForFunctionPointer\\b)",
+      "keywords": ["virtualprotect", "writeprocessmemory", "getdelegateforfunctionpointer"],
       "description": "Memory-protection flip followed by executable injection — shellcode staging pattern"
     },
     {
@@ -686,6 +781,7 @@
       "category": "persistence",
       "severity": "high",
       "pattern": "(?i)(fodhelper|computerdefaults|sdclt|eventvwr|compmgmtlauncher|slui|wuauclt|DiskCleanup)[\\s\\S]{0,200}(bypass|elevat|HKCU|registry|CurVer|DelegateExecute|autoelevate|ms-settings|New-Item|reg\\s+add|Set-Item|Start-Process)|(bypass|HKCU|DelegateExecute|ms-settings|Shell\\\\\\\\Open\\\\\\\\command)[\\s\\S]{0,200}(fodhelper|computerdefaults|sdclt|eventvwr|compmgmtlauncher)",
+      "keywords": ["fodhelper", "computerdefaults", "sdclt", "eventvwr", "compmgmtlauncher", "slui", "wuauclt", "diskcleanup", "bypass", "hkcu", "delegateexecute", "ms-settings"],
       "description": "UAC bypass via trusted binary (fodhelper/computerdefaults/eventvwr) + registry hijack"
     },
     {
@@ -693,6 +789,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)Set-MpPreference\\s+(-DisableRealtimeMonitoring|-DisableBehaviorMonitoring|-DisableBlockAtFirstSeen|-DisableIOAVProtection|-DisableScriptScanning)\\s+\\$?true",
+      "keywords": ["set-mppreference"],
       "description": "Disabling Windows Defender real-time monitoring / behavior / script scanning"
     },
     {
@@ -700,6 +797,7 @@
       "category": "anti-forensics",
       "severity": "high",
       "pattern": "(?i)(Remove-MpThreat|\"C:\\\\Program\\s+Files\\\\Windows\\s+Defender\\\\MpCmdRun\"\\s+-removedefinitions|windefend.*stop|sc\\.exe?\\s+stop\\s+WinDefend)",
+      "keywords": ["remove-mpthreat", "mpcmdrun", "windefend"],
       "description": "Removing/stopping Windows Defender definitions — blinding AV before payload"
     },
     {
@@ -707,6 +805,7 @@
       "category": "credential-theft",
       "severity": "high",
       "pattern": "(?i)(vaultcmd\\b|CredEnumerate|CredRead|\\[Windows\\.Security\\.Credentials\\b|PasswordVault|\\/list\\s+Windows\\s+Vault|cmdkey\\s+/list|mimikatz|sekurlsa|lsadump)",
+      "keywords": ["vaultcmd", "credenumerate", "credread", "[windows.security.credentials", "passwordvault", "vault", "cmdkey", "mimikatz", "sekurlsa", "lsadump"],
       "description": "Windows Credential Manager / vault access or mimikatz-style credential dump"
     },
     {
@@ -714,6 +813,7 @@
       "category": "exfil",
       "severity": "medium",
       "pattern": "(?i)(send-mailmessage|net\\.mail\\.smtpclient|ssmtp|sendemail|mutt\\s+-s|mail\\s+-s)\\b[\\s\\S]{0,80}(@|password|credential|secret|attach|body)",
+      "keywords": ["send-mailmessage", "net.mail.smtpclient", "ssmtp", "sendemail", "mutt", "mail"],
       "description": "Direct SMTP email exfiltration (Send-MailMessage / SmtpClient / mutt / mail)"
     },
     {
@@ -721,6 +821,7 @@
       "category": "exfil",
       "severity": "medium",
       "pattern": "(?i)(s3\\s+cp|aws\\s+s3\\s+(cp|sync)|azcopy\\s+copy|gsutil\\s+cp|rclone\\s+copy|megatools|onedrive\\s+upload|dropbox_uploader)(\\s|\\n)+[^\\n]*(credential|secret|ssh|kube|config|\\\\.env|\\\\.aws|\\\\.ssh|/etc/|passwd)",
+      "keywords": ["s3", "aws", "azcopy", "gsutil", "rclone", "megatools", "onedrive", "dropbox_uploader"],
       "description": "Uploading credential files to cloud storage (s3/azcopy/gsutil/rclone/mega/dropbox)"
     },
     {
@@ -728,6 +829,7 @@
       "category": "network",
       "severity": "high",
       "pattern": "(?i)nsenter\\s+--mount|nsenter\\s+--target\\s+1|nsenter\\s+--all.*\\/bin\\/(ba)?sh|unshare\\s+-[rRm]|--cap-add=SYS_ADMIN|--cap-add=SYS_PTRACE|--security-opt\\s+apparmor=unconfined|--security-opt\\s+seccomp=unconfined",
+      "keywords": ["nsenter", "unshare", "cap-add", "security-opt"],
       "description": "Container escape via nsenter/unshare or disabling security protections (SYS_ADMIN / apparmor=unconfined)"
     },
     {
@@ -735,6 +837,7 @@
       "category": "persistence",
       "severity": "high",
       "pattern": "(?i)(LD_PRELOAD|ld\\.so\\.preload|\\/etc\\/ld\\.so\\.preload|\\/etc\\/ld\\.so\\.pre\\.d\\/|\\.so\\b[\\s\\S]{0,60}\\bchmod\\s+\\+x|\\bldd\\b[\\s\\S]{0,40}(hook|inject|evil))",
+      "keywords": ["ld_preload", "ld.so.pre", "chmod", "ldd"],
       "description": "LD_PRELOAD / ld.so.preload manipulation — library injection persistence (Linux)"
     }
   ]

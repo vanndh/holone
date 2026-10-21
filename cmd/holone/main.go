@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,7 +34,7 @@ import (
 	"github.com/vanndh/holone/internal/sentinel"
 )
 
-const version = "0.4.1"
+const version = "0.4.2"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -148,6 +149,9 @@ func cmdProxy(args []string) error {
 
 	if !officialHost(up.Host) {
 		fmt.Printf("%s⚠  upstream %s is NOT an official Anthropic/OpenAI endpoint — it can read every prompt you send.%s\n", yellow, up.Host, reset)
+	}
+	if warning := nonLocalListenWarning(*listen); warning != "" {
+		fmt.Printf("%s%s%s\n", yellow, warning, reset)
 	}
 	if mode == proxy.ModeBlock {
 		fmt.Printf("%s⚠  block mode is enforced for anthropic/openai/responses streams and buffered responses; unknown stream protocols run monitor-only (protection=unsupported).%s\n", yellow, reset)
@@ -300,7 +304,7 @@ func cmdDashboard(args []string) error {
 	logPath := fs.String("log", defaultLogPath(), "audit log file (jsonl); '-' for stdout")
 	fs.Parse(args)
 
-	if !dashboardListenIsLocal(*listen) {
+	if !listenIsLocal(*listen) {
 		return fmt.Errorf("dashboard --listen must be localhost or loopback")
 	}
 	if *token == "" {
@@ -327,10 +331,12 @@ func cmdDashboard(args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		res, err := scanner.Scan(ctx, scanner.Options{
-			BaseURL: req.BaseURL,
-			APIKey:  req.APIKey,
-			Model:   req.Model,
-			Engine:  eng,
+			BaseURL:  req.BaseURL,
+			APIKey:   req.APIKey,
+			Model:    req.Model,
+			Protocol: req.Protocol,
+			Path:     req.Path,
+			Engine:   eng,
 		})
 		if err != nil {
 			return nil, err
@@ -557,13 +563,27 @@ func officialHost(host string) bool {
 	return h == "api.anthropic.com" || h == "api.openai.com"
 }
 
-func dashboardListenIsLocal(addr string) bool {
-	host, _, ok := strings.Cut(addr, ":")
-	if !ok || host == "" {
+// nonLocalListenWarning returns the warning to print when addr is reachable by
+// other machines, or "" when the listener is loopback-only.
+func nonLocalListenWarning(addr string) string {
+	if listenIsLocal(addr) {
+		return ""
+	}
+	return fmt.Sprintf("⚠  --listen %s is NOT loopback: other machines on your network can reach this proxy, and their traffic will be inspected and forwarded through it. Use 127.0.0.1 unless you really need remote access.", addr)
+}
+
+// listenIsLocal reports whether addr binds only to the local machine. An
+// unspecified host (":8787"), 0.0.0.0, or a LAN address counts as non-local.
+func listenIsLocal(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
 		return false
 	}
-	host = strings.Trim(host, "[]")
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func truncateStr(s string, n int) string {

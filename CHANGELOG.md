@@ -4,6 +4,36 @@
 [keep a changelog](https://keepachangelog.com/), версионирование стремится
 следовать [semver](https://semver.org/).
 
+## [0.4.2] — 2026-10-21
+
+### производительность
+
+- **keyword-prefilter**: у 103/105 правил появились обязательные литералы; при их
+  отсутствии regex не запускается. эквивалентность детекта подтверждена
+  soundness-тестом (172 сэмпла) и дифференциальным фаззингом против движка без
+  keywords (0 расхождений).
+- **параллельная оценка правил** для входов ≥32 KiB.
+- по бенчмаркам: 1 KiB ~29x, 1 MiB ~68x, 10 MiB stream ~69x быстрее; 1 MiB
+  теперь ~0.124 s (было ~8.5 s). worst case (adversarial, почти все keywords
+  присутствуют) описан в BENCHMARKS.md.
+
+### добавлено
+
+- **BENCHMARKS.md** (методика, хост, таблицы ns/op/MB/s/allocs, before/after,
+  fuzz), `scripts/bench.sh` + `bench.ps1`.
+- **7 fuzz-целей** и bounded-memory инварианты (SSE line/frame, окно инспектора);
+  ~2.4M исполнений без падений.
+- **dashboard scan**: поля protocol/path; бейдж protection в activity; warning при
+  non-loopback `--listen`.
+
+### исправлено
+
+- **redaction**: Slack-токены маскируются и при склейке с текстом (`0xoxa-...`).
+
+### изменено
+
+- **README**: troubleshooting и ссылка на BENCHMARKS; версия 0.4.2.
+
 ## [0.4.1] — 2026-10-21
 
 ### безопасность
@@ -229,6 +259,7 @@
   вредоносного провайдера (`mockevil`), бенчмарки латентности и ci под
   windows/macos/linux.
 
+[0.4.2]: https://github.com/vanndh/holone/releases/tag/v0.4.2
 [0.4.1]: https://github.com/vanndh/holone/releases/tag/v0.4.1
 [0.4.0]: https://github.com/vanndh/holone/releases/tag/v0.4.0
 [0.3.0]: https://github.com/vanndh/holone/releases/tag/v0.3.0

@@ -24,6 +24,7 @@ func BenchmarkMonitorPassthrough(b *testing.B) {
 	front := httptest.NewServer(p)
 	defer front.Close()
 
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp, err := http.Post(front.URL+"/v1/messages?profile=clean", "application/json", strings.NewReader(bodyNoTools))
@@ -40,6 +41,7 @@ func BenchmarkDirect(b *testing.B) {
 	upstream := httptest.NewServer(mockevil.Handler())
 	defer upstream.Close()
 
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		resp, err := http.Post(upstream.URL+"/v1/messages?profile=clean", "application/json", strings.NewReader(bodyNoTools))

@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/vanndh/holone/internal/scanner"
 )
 
 func New(cfg Config) *Server {
@@ -161,6 +163,13 @@ func (s *Server) routes() {
 			writeError(w, "base_url required", http.StatusBadRequest)
 			return
 		}
+		protocol, err := scanner.NormalizeProtocol(req.Protocol)
+		if err != nil {
+			writeError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req.Protocol = protocol
+		req.Path = strings.TrimSpace(req.Path)
 		result, err := s.cfg.ScanFn(req)
 		if err != nil {
 			writeError(w, err.Error(), http.StatusInternalServerError)

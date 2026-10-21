@@ -333,7 +333,8 @@ const I18N = {
     scanResult: 'Результат сканирования', auditResult: 'Результат аудита',
     scanningProbe: 'Сканирование проб...', runningAudit: 'Аудит выполняется...',
     resolved: 'Резолвится', tls: 'TLS', issuer: 'эмитент', ageDays: 'дней',
-    protocol: 'Протокол', declared: 'объявлены', notDeclared: 'не объявлены',
+    protocol: 'Протокол', scanPath: 'Путь (опц.)', supported: 'поддерживается', notSupported: 'не поддерживается',
+    declared: 'объявлены', notDeclared: 'не объявлены',
     noActiveInjection: 'Активных инъекций не обнаружено',
     couldNotProbe: 'Не удалось проверить',
     noScanData: 'Запустите скан для получения результатов',
@@ -372,7 +373,8 @@ const I18N = {
     scanResult: 'Scan Result', auditResult: 'Audit Result',
     scanningProbe: 'Scanning probes...', runningAudit: 'Running audit...',
     resolved: 'Resolves', tls: 'TLS', issuer: 'issuer', ageDays: 'days',
-    protocol: 'Protocol', declared: 'declared', notDeclared: 'not declared',
+    protocol: 'Protocol', scanPath: 'Path (opt.)', supported: 'supported', notSupported: 'not supported',
+    declared: 'declared', notDeclared: 'not declared',
     noActiveInjection: 'No active injection detected',
     couldNotProbe: 'Could not probe',
     noScanData: 'Run a scan to see results', noAuditData: 'Run an audit to check the system',
@@ -608,9 +610,10 @@ function renderFeed(container, items, emptyMsg, emptyEl) {
   container.innerHTML = items.map(e => {
     const cls = e.type === 'blocked' ? 'red' : e.type === 'alert' ? 'yellow' : e.type === 'clean' ? 'green' : 'dim';
     const rules = (e.rule_ids||[]).map(id => `<span class="badge dim">${esc(id)}</span>`).join(' ');
+    const protection = e.protection && e.protection !== 'protected' ? `<span class="badge yellow">${esc(e.protection)}</span>` : '';
     return `<div class="entry">
       <span class="time">${esc(e.time||'')}</span>
-      <span class="type"><span class="badge ${cls}">${esc(e.type||'')}</span></span>
+      <span class="type"><span class="badge ${cls}">${esc(e.type||'')}</span>${protection ? ' '+protection : ''}</span>
       <span class="msg" onclick='showActivityDetails(${JSON.stringify(JSON.stringify(e))})' style="cursor:pointer">${esc(e.message || e.verdict || '')} ${rules ? '<span style="display:inline-flex;gap:4px;flex-wrap:wrap;margin-left:8px">'+rules+'</span>' : ''}</span>
     </div>`;
   }).join('');
@@ -640,7 +643,7 @@ function showActivityDetails(raw) {
   const findings = (e.findings||[]).length ? (e.findings||[]).map(f => `<div class="probe-finding"><span class="sev ${f.severity}">[${f.severity}]</span>${esc(f.rule_id)} — ${esc(f.description||'')}</div>`).join('') : `<div class="empty">${t('noFindings')}</div>`;
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
-  overlay.innerHTML = `<div class="modal" style="width:760px;max-width:96vw"><h3>${esc(e.message||e.type||'')}</h3><div class="field"><label>${t('details')}</label><div class="td-mono">${esc(JSON.stringify({type:e.type,provider:e.provider,protocol:e.protocol,verdict:e.verdict,path:e.path,method:e.method,max_severity:e.max_severity}, null, 2))}</div></div>${e.request_body?`<div class="field"><label>${t('requestBody')}</label><div class="td-mono">${esc(e.request_body)}</div></div>`:''}<div class="field"><label>${t('findingsTitle')}</label>${findings}</div><div class="modal-actions"><button class="btn secondary" onclick="this.closest('.modal-overlay').remove()">${t('close')}</button></div></div>`;
+  overlay.innerHTML = `<div class="modal" style="width:760px;max-width:96vw"><h3>${esc(e.message||e.type||'')}</h3><div class="field"><label>${t('details')}</label><div class="td-mono">${esc(JSON.stringify({type:e.type,provider:e.provider,protocol:e.protocol,verdict:e.verdict,path:e.path,method:e.method,max_severity:e.max_severity,protection:e.protection}, null, 2))}</div></div>${e.request_body?`<div class="field"><label>${t('requestBody')}</label><div class="td-mono">${esc(e.request_body)}</div></div>`:''}<div class="field"><label>${t('findingsTitle')}</label>${findings}</div><div class="modal-actions"><button class="btn secondary" onclick="this.closest('.modal-overlay').remove()">${t('close')}</button></div></div>`;
   document.body.appendChild(overlay);
 }
 
@@ -706,6 +709,10 @@ function renderScan(main) {
         <div class="field"><label>${t('modelField')}</label><input id="scan-model" placeholder="gpt-4o-mini"></div>
         <div class="field" style="display:flex;align-items:flex-end"><button class="btn" style="width:100%" onclick="doScan()" id="scan-btn">${t('scanProvider')}</button></div>
       </div>
+      <div class="form-row-3">
+        <div class="field"><label>${t('protocol')}</label><select id="scan-protocol"><option value="auto">auto</option><option value="chat-completions">chat-completions</option><option value="responses">responses</option><option value="anthropic">anthropic</option></select></div>
+        <div class="field"><label>${t('scanPath')}</label><input id="scan-path" placeholder="/v1/chat/completions"></div>
+      </div>
       <div id="scan-progress"></div>
     </div>
     <div id="scan-result">${scanResult ? renderScanResultHTML(scanResult) : `<div class="empty">${t('noScanData')}</div>`}</div>`;
@@ -716,6 +723,8 @@ async function doScan() {
   const url = document.getElementById('scan-url').value.trim();
   const key = document.getElementById('scan-key').value.trim();
   const model = document.getElementById('scan-model').value.trim();
+  const protocol = document.getElementById('scan-protocol').value || 'auto';
+  const path = document.getElementById('scan-path').value.trim();
   if (!url) { toast(t('enterUrl'), 'error'); return; }
   scanInProgress = true;
   const btn = document.getElementById('scan-btn');
@@ -724,7 +733,7 @@ async function doScan() {
   document.getElementById('scan-result').innerHTML = '';
   try {
     const res = await api('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({base_url:url, api_key:key, model:model})});
+      body: JSON.stringify({base_url:url, api_key:key, model:model, protocol:protocol, path:path})});
     scanResult = res;
     document.getElementById('scan-result').innerHTML = renderScanResultHTML(res);
     toast(t('scanComplete'), 'success');
@@ -754,6 +763,7 @@ function renderScanResultHTML(r) {
     </div>`;
   }).join('');
   const ioc = r.blocklist_hits && r.blocklist_hits.length ? `<div style="margin-bottom:12px">${r.blocklist_hits.map(h=>`<span class="badge red">${esc(h)}</span>`).join(' ')}</div>` : '';
+  const discovery = r.discovery && r.discovery.length ? `<div style="margin-bottom:12px">${r.discovery.map(d=>`<span class="badge ${d.supported?'green':'dim'}" title="${esc(d.endpoint||'')}">${esc(d.protocol)}: ${d.supported?t('supported'):t('notSupported')}</span>`).join(' ')}</div>` : '';
   const summary = lang === 'ru' ? r.summary_ru : r.summary_en;
   const notesData = lang === 'ru' ? (r.notes_ru || []) : (r.notes || []);
   const recommendationsData = lang === 'ru' ? (r.recommendations_ru || []) : (r.recommendations_en || []);
@@ -771,6 +781,7 @@ function renderScanResultHTML(r) {
       <span style="color:var(--dim);font-size:12px;margin-left:12px">${t('host')}: ${esc(r.host||'')}</span>
       ${tls}${ips}
     </div>
+    ${discovery}
     ${ioc}
     ${summary ? `<h3>${t('summary')}</h3><div class="note-list"><div class="note-item">${esc(summary)}</div></div>` : ''}
     <h3>${t('probes')}</h3>

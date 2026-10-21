@@ -150,3 +150,30 @@ func TestWebhookFindingsRedacted(t *testing.T) {
 		})
 	}
 }
+
+// Slack tokens may be glued to other text by the provider. Redaction must catch
+// them regardless of a word boundary, while key prefixes keep their boundary.
+func TestRedactGluedSlackToken(t *testing.T) {
+	in := "xoxa-0000000000 0xoxa-0000000000"
+	want := "xoxa-[REDACTED] 0xoxa-[REDACTED]"
+	if got := redact(in); got != want {
+		t.Fatalf("redact(%q) = %q, want %q", in, got, want)
+	}
+}
+
+// The boundary requirement for sk-/gh[pousr]_/AKIA stays: word-internal
+// lookalikes must not be shredded, or ordinary prose would lose words like
+// "risk-assessment-...".
+func TestRedactKeepsKeyBoundaries(t *testing.T) {
+	cases := []string{
+		"risk-assessment-foo1234567890123456",
+		"disk-0123456789abcdefghijkl",
+		"0ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+		"0AKIAIOSFODNN7EXAMPLE",
+	}
+	for _, in := range cases {
+		if got := redact(in); got != in {
+			t.Errorf("redact(%q) = %q, want unchanged", in, got)
+		}
+	}
+}

@@ -52,6 +52,7 @@ type ActivityEntry struct {
 	Protocol    string            `json:"protocol,omitempty"`
 	Verdict     string            `json:"verdict,omitempty"`
 	MaxSeverity string            `json:"max_severity,omitempty"`
+	Protection  string            `json:"protection,omitempty"`
 	RuleIDs     []string          `json:"rule_ids,omitempty"`
 	Message     string            `json:"message,omitempty"`
 	Path        string            `json:"path,omitempty"`
@@ -80,6 +81,11 @@ type ScanRequest struct {
 	BaseURL string `json:"base_url"`
 	APIKey  string `json:"api_key"`
 	Model   string `json:"model"`
+	// Protocol selects the wire protocol: auto (default), chat-completions,
+	// responses, or anthropic. The API normalizes and validates it.
+	Protocol string `json:"protocol,omitempty"`
+	// Path optionally overrides the endpoint path derived from the protocol.
+	Path string `json:"path,omitempty"`
 }
 
 // ProxyRequest controls the dashboard-managed local proxy.
@@ -557,6 +563,7 @@ func (pm *ProxyManager) recordDecision(p Provider, d proxy.Decision) {
 		Protocol:    d.Protocol,
 		Verdict:     d.Verdict,
 		MaxSeverity: d.MaxSeverity,
+		Protection:  d.Protection,
 		RuleIDs:     ruleIDs,
 		Message:     fmt.Sprintf("%s %s %s", strings.ToUpper(d.Verdict), d.Protocol, d.Path),
 		Path:        d.Path,

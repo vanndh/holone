@@ -21,8 +21,11 @@ var redactions = []struct {
 	{regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}`), "Bearer [REDACTED]"},
 	// OpenAI-style secret keys.
 	{regexp.MustCompile(`\b(sk-)[A-Za-z0-9_-]{16,}`), "${1}[REDACTED]"},
-	// Slack bot/user tokens.
-	{regexp.MustCompile(`\b(xox[baprs]-)[A-Za-z0-9-]{10,}`), "${1}[REDACTED]"},
+	// Slack bot/user tokens. No \b here on purpose: a token glued to other
+	// text (e.g. "0xoxa-...") is still a credential, and redaction must not
+	// depend on how the provider happened to concatenate it. The xox[baprs]-
+	// prefix is distinctive enough that word-internal matching is safe.
+	{regexp.MustCompile(`(xox[baprs]-)[A-Za-z0-9-]{10,}`), "${1}[REDACTED]"},
 	// GitHub tokens.
 	{regexp.MustCompile(`\b(gh[pousr]_)[A-Za-z0-9]{20,}`), "${1}[REDACTED]"},
 	// AWS access key ids.

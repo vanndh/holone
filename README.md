@@ -217,7 +217,12 @@ holone dashboard
 - показывает live-активность: clean / alert / blocked / scan / audit;
 - отдаёт каталог правил через `/api/rules`: `id`, категория, severity, pattern,
   описание на английском и русском;
-- запускает `scan` и `audit` из UI.
+- запускает `scan` и `audit` из UI; в форме скана можно выбрать `protocol`
+  (`auto|chat-completions|responses|anthropic`) и необязательный `path` — те же
+  параметры, что у `holone scan`;
+- показывает `protection` решения в ленте активности: если поток реально не
+  защищён, рядом с записью появляется жёлтый бейдж `monitor-only` /
+  `unsupported`.
 
 безопасность дашборда:
 
@@ -309,6 +314,31 @@ holone sentinel --interval 30s
 
 ---
 
+## troubleshooting / частые ошибки
+
+- **`413` на запрос или `502` на ответ.** сработал локальный лимит тела, а не
+  провайдер: подними `--max-request-size` / `--max-response-size` (например
+  `--max-request-size 64MiB --max-response-size 128MiB`).
+- **`protection: unsupported`.** в `block`-режиме поток неизвестного протокола
+  нельзя безопасно переписать, поэтому он идёт monitor-only. убедись, что клиент
+  ходит на `/v1/messages` (anthropic), `/v1/chat/completions` (openai chat) или
+  `/v1/responses` (responses); нестандартный путь разбирай через
+  `holone scan --protocol … --path …`.
+- **`bind: address already in use`.** порт уже занят другим holone/прокси.
+  закрой старый процесс или возьми другой порт: `--listen 127.0.0.1:8788`
+  (для дашборда — `holone dashboard --listen 127.0.0.1:9091`).
+- **`401` / `403` от upstream.** holone пробрасывает твой ключ как есть, поэтому
+  ошибка почти всегда в клиенте: проверь base url (должен быть
+  `http://127.0.0.1:8787`), сам ключ и выбранную модель. дашборд ключи профилей
+  не сохраняет.
+- **`holone scan` получает `404`.** endpoint не угадан автоматически: укажи
+  `--protocol chat-completions|responses|anthropic` и/или явный `--path /v1/...`.
+- **`holone scan` в режиме `auto`** перебирает layout'ы и печатает, какие
+  поддержаны (supported / not supported) — по этому списку проще выбрать
+  `--protocol` и `--path`. те же поля есть в форме скана дашборда.
+
+---
+
 ## структура проекта
 
 ```
@@ -331,6 +361,24 @@ go run ./mockevil &                             # фейковый вредон�
 holone proxy --upstream http://127.0.0.1:9999
 curl -N -d '{"messages":[]}' 'http://127.0.0.1:8787/v1/messages?profile=evil'
 ```
+
+воспроизводимые бенчмарки и fuzz-проверки описаны в [BENCHMARKS.md](BENCHMARKS.md):
+методика, хост и тулчейн, таблицы `ns/op` / `MB/s` / `allocs/op` и результаты
+fuzz. запуск всего набора одной командой:
+
+```sh
+sh scripts/bench.sh
+```
+
+```powershell
+# windows
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bench.ps1
+```
+
+актуальные `ns/op`, `MB/s` и `allocs/op` — в [BENCHMARKS.md](BENCHMARKS.md): детект-движок
+исторически был доминирующей стоимостью (регулярки по каждому байту входа), после
+оптимизации (keyword-prefilter + параллельная оценка) цифры заметно изменились — см.
+таблицы; SSE-парсер при этом заметно быстрее и узким местом не является.
 
 ---
 

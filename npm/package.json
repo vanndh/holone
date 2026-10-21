@@ -1,6 +1,6 @@
 {
   "name": "holone",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Client-independent guard against malicious LLM API providers: inspects and blocks injected tool calls in LLM traffic.",
   "license": "MIT",
   "bin": {

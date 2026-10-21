@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/vanndh/holone/rules"
 )
@@ -81,6 +83,11 @@ type ruleSpec struct {
 	Pattern       string `json:"pattern"`
 	Description   string `json:"description"`
 	DescriptionRU string `json:"description_ru,omitempty"`
+
+	// Keywords, when present, are literals of which at least one MUST occur in
+	// any match of Pattern (case-insensitive). They are only a prefilter: a rule
+	// without them is always evaluated.
+	Keywords []string `json:"keywords,omitempty"`
 }
 
 type rulesFile struct {
@@ -89,9 +96,10 @@ type rulesFile struct {
 }
 
 type compiledRule struct {
-	spec ruleSpec
-	sev  Severity
-	re   *regexp.Regexp
+	spec     ruleSpec
+	sev      Severity
+	re       *regexp.Regexp
+	keywords []string // lowercased; empty = always run the regex
 }
 
 // RuleInfo is a safe, UI-facing description of a detection rule.
@@ -133,9 +141,10 @@ type Finding struct {
 
 // Engine is a compiled, immutable, concurrency-safe detector.
 type Engine struct {
-	rules    []compiledRule
-	terms    []blockTerm
-	descByID map[string]string
+	rules       []compiledRule
+	terms       []blockTerm
+	descByID    map[string]string
+	hasKeywords bool // at least one rule has a keyword prefilter
 }
 
 // New compiles an engine from raw rules.json and blocklist.json bytes.
@@ -153,7 +162,11 @@ func New(rulesJSON, blocklistJSON []byte) (*Engine, error) {
 		if err != nil {
 			return nil, fmt.Errorf("rule %q: bad pattern: %w", rs.ID, err)
 		}
-		e.rules = append(e.rules, compiledRule{spec: rs, sev: ParseSeverity(rs.Severity), re: re})
+		kw := normalizeKeywords(rs.Keywords)
+		if len(kw) > 0 {
+			e.hasKeywords = true
+		}
+		e.rules = append(e.rules, compiledRule{spec: rs, sev: ParseSeverity(rs.Severity), re: re, keywords: kw})
 		e.descByID[rs.ID] = rs.Description
 	}
 
@@ -242,12 +255,29 @@ func (e *Engine) Rules() []RuleInfo {
 	return out
 }
 
+// Inputs at least this large are worth evaluating in parallel: the regexes are
+// expensive enough per byte to amortise the goroutine setup.
+const parallelInspectMin = 32 << 10
+
+// minRulesPerGroup keeps each parallel group large enough to be useful.
+const minRulesPerGroup = 8
+
 // Inspect scans a single piece of text and returns all findings. source is a
 // short label describing where the text came from (e.g. "tool_use:Bash").
+//
+// Rules that declare required keywords are skipped when none of those literals
+// occurs in the text, which avoids most regex work on benign prose. The result
+// is identical to evaluating every regex: keywords are only provable literals.
 func (e *Engine) Inspect(text, source string) []Finding {
 	if text == "" {
 		return nil
 	}
+	// One lowercase copy serves both the keyword prefilter and the IOC scan.
+	var low string
+	if e.hasKeywords {
+		low = strings.ToLower(text)
+	}
+
 	var out []Finding
 	seen := make(map[string]struct{})
 	add := func(f Finding) {
@@ -259,24 +289,22 @@ func (e *Engine) Inspect(text, source string) []Finding {
 		out = append(out, f)
 	}
 
-	for _, r := range e.rules {
-		loc := r.re.FindStringIndex(text)
-		if loc == nil {
-			continue
+	if len(text) >= parallelInspectMin {
+		for _, f := range e.inspectRulesParallel(text, low, source) {
+			add(f)
 		}
-		add(Finding{
-			RuleID:      r.spec.ID,
-			Category:    r.spec.Category,
-			Severity:    r.sev.String(),
-			Match:       redact(truncate(text[loc[0]:loc[1]], 160)),
-			Excerpt:     redact(excerpt(text, loc[0], loc[1])),
-			Source:      source,
-			Description: r.spec.Description,
-		})
+	} else {
+		for i := range e.rules {
+			if f, ok := e.matchRule(i, text, low, source); ok {
+				add(f)
+			}
+		}
 	}
 
 	if len(e.terms) > 0 {
-		low := strings.ToLower(text)
+		if low == "" {
+			low = strings.ToLower(text)
+		}
 		for _, bt := range e.terms {
 			idx := strings.Index(low, bt.lower)
 			if idx < 0 {
@@ -292,6 +320,107 @@ func (e *Engine) Inspect(text, source string) []Finding {
 				Description: "Known indicator of compromise (" + bt.kind + ")",
 			})
 		}
+	}
+	return out
+}
+
+// matchRule applies the keyword prefilter, then evaluates the rule's regex.
+func (e *Engine) matchRule(i int, text, low, source string) (Finding, bool) {
+	r := &e.rules[i]
+	if len(r.keywords) > 0 && !containsAny(low, r.keywords) {
+		return Finding{}, false
+	}
+	loc := r.re.FindStringIndex(text)
+	if loc == nil {
+		return Finding{}, false
+	}
+	return Finding{
+		RuleID:      r.spec.ID,
+		Category:    r.spec.Category,
+		Severity:    r.sev.String(),
+		Match:       redact(truncate(text[loc[0]:loc[1]], 160)),
+		Excerpt:     redact(excerpt(text, loc[0], loc[1])),
+		Source:      source,
+		Description: r.spec.Description,
+	}, true
+}
+
+// containsAny reports whether s contains at least one lowercased keyword.
+func containsAny(s string, keywords []string) bool {
+	for _, k := range keywords {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// inspectRulesParallel evaluates contiguous rule groups concurrently and merges
+// their findings in rule order, so the output is identical to the serial path.
+// It shares no mutable state between groups: every result slice is owned by one
+// goroutine, and the engine itself is immutable.
+func (e *Engine) inspectRulesParallel(text, low, source string) []Finding {
+	groups := runtime.GOMAXPROCS(0)
+	if maxGroups := len(e.rules) / minRulesPerGroup; groups > maxGroups {
+		groups = maxGroups
+	}
+	if groups < 1 {
+		groups = 1
+	}
+
+	if groups == 1 {
+		out := make([]Finding, 0, len(e.rules))
+		for i := range e.rules {
+			if f, ok := e.matchRule(i, text, low, source); ok {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+
+	results := make([][]Finding, groups)
+	var wg sync.WaitGroup
+	for g := range groups {
+		start := g * len(e.rules) / groups
+		end := (g + 1) * len(e.rules) / groups
+		wg.Add(1)
+		go func(g, start, end int) {
+			defer wg.Done()
+			var fs []Finding
+			for i := start; i < end; i++ {
+				if f, ok := e.matchRule(i, text, low, source); ok {
+					fs = append(fs, f)
+				}
+			}
+			results[g] = fs
+		}(g, start, end)
+	}
+	wg.Wait()
+
+	out := make([]Finding, 0, len(e.rules))
+	for _, fs := range results {
+		out = append(out, fs...)
+	}
+	return out
+}
+
+// normalizeKeywords lowercases, trims and deduplicates keyword literals.
+func normalizeKeywords(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, k := range in {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k == "" {
+			continue
+		}
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, k)
 	}
 	return out
 }
