@@ -50,7 +50,9 @@ docker / wsl персистентность. работает с любым кл
 
 ✅ **палит непрошеные вызовы инструментов.** если в ответе есть `tool_use`, хотя
 клиент не объявлял инструментов — это сильный признак инъекции, holone сам
-поднимает его до high.
+поднимает его до high. если инструменты объявлены, но провайдер вернул имя,
+которого не было в запросе, — это high `proto-tool-name-not-declared` (в
+block-режиме блокируется).
 
 ✅ **специфично для ai-клиентов: ловит отравление конфига.** главный слепой
 пятак старых детекторов — провайдер заставляет клиента переписать свой
@@ -81,6 +83,10 @@ irm https://raw.githubusercontent.com/vanndh/holone/main/scripts/install.ps1 | i
 # linux / macos
 curl -fsSL https://raw.githubusercontent.com/vanndh/holone/main/scripts/install.sh | sh
 ```
+
+оба установщика перед установкой скачивают `SHA256SUMS.txt` того же релиза и
+сверяют sha-256 скачанного бинаря. при несовпадении или отсутствии записи —
+ошибка и отказ: файл не становится исполняемым и не попадает в `PATH`.
 
 **через go** (нужен go 1.26+):
 
@@ -156,7 +162,29 @@ holone proxy --upstream <url-провайдера> [--listen 127.0.0.1:8787] [--
 | чистый текст | не трогается | не трогается |
 
 флаги: `--log <файл|->` (jsonl-лог, по умолчанию `~/.holone/holone.log`),
-`--rules <файл>` / `--blocklist <файл>` — заменить встроенные правила.
+`--rules <файл>` / `--blocklist <файл>` — заменить встроенные правила,
+`--max-request-size` / `--max-response-size` — лимиты тел (байты или `KiB`/`MiB`/`GiB`;
+по умолчанию 32 MiB на запрос и 64 MiB на ответ).
+
+стрим инспектируется **rolling-окнами** 256 KiB с перекрытием 8 KiB по всему
+ответу, а не только в первых мегабайтах — слепой зоны после 1 MiB больше нет.
+в block-режиме буферизация tool-call ограничена 8 MiB: превышение — fail-closed,
+вызов заменяется безопасной заметкой и high-finding `proto-toolcall-oversized`.
+
+`Content-Encoding: gzip` и `deflate` декодируются и инспектируются. `br`, `zstd`
+и неизвестные кодировки в block-режиме дают `502` (проверить нельзя — не
+пропускаем), в monitor — проходят как есть с сохранённым заголовком и medium
+`proto-encoding-uninspected`. заголовок никогда не срезается, если тело не
+декодировано.
+
+превышение лимита тела не усекается молча: request → `413`, response → `502`.
+OpenAI Responses API (`/v1/responses`) парсится нативно; вредоносный
+`function_call` в block-режиме рвёт стрим fail-closed (`event: error`).
+неизвестные stream-протоколы в block-режиме не выдают за защищённые: поток
+фактически идёт monitor-only, а решение помечается `protection: unsupported`.
+
+в jsonl-логе у каждого решения есть поле `protection`:
+`protected` | `monitor-only` | `unsupported`.
 
 ### `holone dashboard` — центр управления
 
@@ -199,6 +227,15 @@ holone scan https://api-cc.freemodel.dev --key $ANTHROPIC_API_KEY
 печатает risk-score и вердикт. чистый результат **не** доказывает безопасность —
 см. честную оговорку выше.
 
+флаги: `--protocol auto|chat-completions|responses|anthropic` (по умолчанию
+`auto`), `--path <путь>` — явный endpoint вместо вычисленного, `--model <id>` —
+модель для проб.
+
+base url нормализуется: `https://host`, `…/v1`, `…/api`, `…/api/v1` (с хвостовым
+слэшем или без) дают корректный путь — `/v1/v1` не появляется. в `auto` режиме
+сканер пробует layout'ы и печатает, какие поддержаны (chat completions,
+responses, anthropic), включая OpenAI Responses API.
+
 ### `holone audit` — разовая проверка машины
 
 ```sh
@@ -229,7 +266,12 @@ holone sentinel --interval 30s
 - **ioc-блоклист** (`rules/blocklist.json`): известные плохие домены, ip, пути,
   имена задач и процессов.
 - **аномалия протокола**: вызов инструмента без объявленных клиентом инструментов
-  = инъекция.
+  = инъекция (`proto-tooluse-unsolicited`). если инструменты объявлены, но
+  провайдер вернул имя, которого не было в запросе, — high
+  `proto-tool-name-not-declared` (в block-режиме блокируется).
+- **redaction**: `Finding.Match` / `Excerpt` маскируются перед записью в лог и
+  дашборд (telegram / discord / slack webhooks, `Bearer`, `sk-…`, `xox…`,
+  `ghp_…`, `AKIA…`). детект при этом по-прежнему идёт по сырому тексту.
 
 оба файла встроены в бинарь (`go:embed`), так что он самодостаточен, и оба можно
 переопределить в рантайме. **новые правила и ioc приветствуются** — см.
@@ -256,7 +298,7 @@ holone sentinel --interval 30s
 ```
 cmd/holone            cli (proxy | scan | audit | sentinel | dashboard)
 internal/dashboard    локальный backend/API центра управления
-internal/proxy        инспектирующий реверс-прокси (anthropic + openai sse)
+internal/proxy        инспектирующий реверс-прокси (anthropic + openai chat/responses sse)
 internal/inspect      движок детекта (регэкспы + ioc)
 internal/scanner      canary-сканер эндпоинта
 internal/sentinel     ос-проверки ioc (windows + posix)

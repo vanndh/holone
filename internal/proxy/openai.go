@@ -30,23 +30,34 @@ type openaiChunk struct {
 
 // streamOpenAI handles an OpenAI Chat Completions SSE response.
 func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *bufio.Reader, st *streamState) {
-	toolArgs := map[int]*strings.Builder{}
+	toolArgs := map[int]*streamInspector{}
 	toolName := map[int]string{}
-	var contentBuf strings.Builder
+	content := newStreamInspector(p.cfg.Engine, "text")
+	// oversized is only meaningful in Block mode, where tool-call chunks are
+	// buffered; it bounds the held-back data.
+	oversized := false
 
 	accumulate := func(c openaiChunk) (hasTool bool, finish string) {
 		for _, ch := range c.Choices {
-			capWrite(&contentBuf, ch.Delta.Content)
+			content.Write(ch.Delta.Content)
 			for _, tc := range ch.Delta.ToolCalls {
 				hasTool = true
-				st.sawTool = true
-				if toolArgs[tc.Index] == nil {
-					toolArgs[tc.Index] = &strings.Builder{}
-				}
 				if tc.Function.Name != "" {
-					toolName[tc.Index] = tc.Function.Name
+					if _, seen := toolName[tc.Index]; !seen || toolName[tc.Index] != tc.Function.Name {
+						toolName[tc.Index] = tc.Function.Name
+						st.checkToolCall(tc.Function.Name)
+					}
+				} else if toolArgs[tc.Index] == nil {
+					// Tool call with no name yet: still an unsolicited call if
+					// the client declared nothing.
+					st.checkToolCall("")
 				}
-				capWrite(toolArgs[tc.Index], tc.Function.Arguments)
+				if !oversized {
+					if toolArgs[tc.Index] == nil {
+						toolArgs[tc.Index] = newStreamInspector(p.cfg.Engine, "tool_call:"+tc.Function.Name)
+					}
+					toolArgs[tc.Index].Write(tc.Function.Arguments)
+				}
 			}
 			if ch.FinishReason != nil && *ch.FinishReason != "" {
 				finish = *ch.FinishReason
@@ -54,10 +65,13 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 		}
 		return
 	}
-	inspectTools := func() {
-		for idx, b := range toolArgs {
-			st.add(p.cfg.Engine.Inspect(b.String(), "tool_call:"+toolName[idx])...)
+	inspectTools := func() []inspect.Finding {
+		var out []inspect.Finding
+		for _, si := range toolArgs {
+			out = append(out, si.Finish()...)
 		}
+		st.add(out...)
+		return out
 	}
 
 	if p.cfg.Mode != ModeBlock {
@@ -78,28 +92,56 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 		}
 		_ = readSSE(r, onLine, onEvent)
 		inspectTools()
-		st.add(p.cfg.Engine.Inspect(contentBuf.String(), "text")...)
-		st.checkAnomaly(false)
+		st.add(content.Finish()...)
 		return
 	}
 
 	// Block: forward content immediately, hold tool-call chunks until verified.
 	var bufChunks [][]byte
 	var bufContent []string // assistant text carried inside each buffered chunk
+	var bufBytes int
 	droppedTool := false
 	emit := func(b []byte) error { return writeAndFlush(w, flusher, b) }
+
+	firstToolName := func(names map[int]string) string {
+		for i := range len(names) {
+			if n := names[i]; n != "" {
+				return n
+			}
+		}
+		for _, n := range names {
+			if n != "" {
+				return n
+			}
+		}
+		return ""
+	}
 
 	// finalize resolves the buffered tool-call chunks. finishRaw (if non-nil) is
 	// a finish chunk that was NOT buffered and must be emitted on the clean path;
 	// finishContent is its assistant text, preserved on the drop path.
 	finalize := func(finishRaw []byte, finishContent string) error {
-		inspectTools()
-		drop := inspect.MaxSeverity(st.findings) == inspect.SevHigh || (st.sawTool && !st.clientTools)
+		findings := inspectTools()
+		drop := inspect.MaxSeverity(findings) == inspect.SevHigh ||
+			inspect.MaxSeverity(st.findings) == inspect.SevHigh ||
+			(st.sawTool && len(st.declaredTools) == 0) || oversized
 		if st.sawTool && drop {
 			droppedTool = true
 			reason := "unsolicited tool call"
-			if len(st.findings) > 0 {
-				reason = st.findings[0].RuleID
+			switch {
+			case oversized:
+				f := oversizedToolFinding(firstToolName(toolName))
+				st.add(f)
+				reason = f.RuleID
+			case len(findings) > 0:
+				reason = findings[0].RuleID
+			default:
+				for _, f := range st.findings {
+					if f.Severity == inspect.SevHigh.String() {
+						reason = f.RuleID
+						break
+					}
+				}
 			}
 			// Preserve legitimate assistant text that shared a chunk with a tool call.
 			for _, c := range bufContent {
@@ -144,34 +186,47 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 			return emit(ev.raw)
 		}
 		hasTool, finish := accumulate(c)
-		content := chunkContent(c)
+		chunkText := chunkContent(c)
+
+		if hasTool && !oversized {
+			bufBytes += len(ev.raw)
+			if bufBytes > maxToolCallBytes {
+				// Hard cap on held-back tool-call data: drop it, flag it, and
+				// let finalize replace it with the safety note.
+				oversized = true
+				bufChunks, bufContent = nil, nil
+				bufBytes = 0
+			}
+		}
 
 		if finish == "" {
-			if hasTool {
+			if hasTool && !oversized {
 				bufChunks = append(bufChunks, ev.raw)
-				bufContent = append(bufContent, content)
+				bufContent = append(bufContent, chunkText)
+				return nil
+			}
+			if oversized {
 				return nil
 			}
 			return emit(ev.raw)
 		}
 
 		// Finish chunk: if it also carried tool-call data, include it in the buffer.
-		if hasTool {
+		if hasTool && !oversized {
 			bufChunks = append(bufChunks, ev.raw)
-			bufContent = append(bufContent, content)
+			bufContent = append(bufContent, chunkText)
 			return finalize(nil, "")
 		}
-		return finalize(ev.raw, content)
+		return finalize(ev.raw, chunkText)
 	}
 
 	_ = readSSE(r, nil, onEvent)
 	// Buffered tool calls with no finish chunk (EOF/disconnect) must still be
 	// inspected and resolved, not silently dropped.
-	if len(bufChunks) > 0 {
+	if len(bufChunks) > 0 || oversized {
 		_ = finalize(nil, "")
 	}
-	st.add(p.cfg.Engine.Inspect(contentBuf.String(), "text")...)
-	st.checkAnomaly(false)
+	st.add(content.Finish()...)
 	if droppedTool {
 		st.blocked = true
 	}

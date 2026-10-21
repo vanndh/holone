@@ -52,6 +52,20 @@ func ParseSeverity(s string) Severity {
 // — a strong signal of provider-side injection.
 const RuleAnomalyUnsolicitedTool = "proto-tooluse-unsolicited"
 
+// RuleAnomalyToolNameNotDeclared is the synthetic rule id used when the client
+// did declare tools, but the provider returned one of a different name.
+const RuleAnomalyToolNameNotDeclared = "proto-tool-name-not-declared"
+
+// RuleAnomalyOversizedToolCall is the synthetic rule id used when a buffered
+// tool call exceeds the hard size cap and cannot be inspected end-to-end; the
+// call is never forwarded.
+const RuleAnomalyOversizedToolCall = "proto-toolcall-oversized"
+
+// RuleAnomalyEncodingUninspected is the synthetic rule id used when the
+// upstream used a Content-Encoding holone cannot decode: in monitor mode the
+// bytes are forwarded untouched, so the gap is surfaced as a finding.
+const RuleAnomalyEncodingUninspected = "proto-encoding-uninspected"
+
 type ruleSpec struct {
 	ID            string `json:"id"`
 	Category      string `json:"category"`
@@ -246,8 +260,8 @@ func (e *Engine) Inspect(text, source string) []Finding {
 			RuleID:      r.spec.ID,
 			Category:    r.spec.Category,
 			Severity:    r.sev.String(),
-			Match:       truncate(text[loc[0]:loc[1]], 160),
-			Excerpt:     excerpt(text, loc[0], loc[1]),
+			Match:       redact(truncate(text[loc[0]:loc[1]], 160)),
+			Excerpt:     redact(excerpt(text, loc[0], loc[1])),
 			Source:      source,
 			Description: r.spec.Description,
 		})
@@ -265,7 +279,7 @@ func (e *Engine) Inspect(text, source string) []Finding {
 				Category:    "ioc",
 				Severity:    SevHigh.String(),
 				Match:       bt.term,
-				Excerpt:     excerpt(text, idx, idx+len(bt.lower)),
+				Excerpt:     redact(excerpt(text, idx, idx+len(bt.lower))),
 				Source:      source,
 				Description: "Known indicator of compromise (" + bt.kind + ")",
 			})

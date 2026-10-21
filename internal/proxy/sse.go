@@ -87,19 +87,3 @@ func writeAndFlush(w io.Writer, flusher interface{ Flush() }, p []byte) error {
 	flusher.Flush()
 	return nil
 }
-
-// maxInspectBuf bounds how much streamed text / tool-call payload we accumulate
-// for inspection, so a hostile upstream cannot exhaust memory. A payload that
-// matters fits well within this; the head is what carries the signal.
-const maxInspectBuf = 1 << 20 // 1 MiB
-
-// capWrite appends s to b unless b is already at the inspection cap.
-func capWrite(b *strings.Builder, s string) {
-	if b.Len() >= maxInspectBuf {
-		return
-	}
-	if b.Len()+len(s) > maxInspectBuf {
-		s = s[:maxInspectBuf-b.Len()]
-	}
-	b.WriteString(s)
-}

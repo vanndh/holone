@@ -15,14 +15,14 @@ package proxy
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -66,8 +66,22 @@ type Decision struct {
 	ClientTools bool              `json:"client_declared_tools"`
 	Verdict     string            `json:"verdict"` // clean | alert | blocked
 	MaxSeverity string            `json:"max_severity"`
+	Protection  string            `json:"protection"` // protected | monitor-only | unsupported
 	Findings    []inspect.Finding `json:"findings,omitempty"`
 }
+
+// Protection levels reported in Decision.Protection.
+const (
+	// ProtectionProtected: the stream is parsed and Block mode can remove a
+	// malicious or undeclared tool call before the client sees it.
+	ProtectionProtected = "protected"
+	// ProtectionMonitorOnly: bytes are inspected but never rewritten (Monitor
+	// mode, or a protocol whose stream we do not rewrite).
+	ProtectionMonitorOnly = "monitor-only"
+	// ProtectionUnsupported: Block mode was requested but the stream format
+	// cannot be enforced, so only detection happens.
+	ProtectionUnsupported = "unsupported"
+)
 
 // Config configures a Proxy.
 type Config struct {
@@ -76,12 +90,20 @@ type Config struct {
 	Mode       Mode
 	Logger     *Logger
 	OnDecision func(Decision) // optional callback (CLI prints alerts)
+
+	// MaxRequestBytes / MaxResponseBytes cap buffered bodies; zero means the
+	// defaults (32 MiB / 64 MiB). Bodies over the cap are rejected, never
+	// truncated.
+	MaxRequestBytes  int64
+	MaxResponseBytes int64
 }
 
 // Proxy is an http.Handler.
 type Proxy struct {
-	cfg    Config
-	client *http.Client
+	cfg         Config
+	client      *http.Client
+	maxRequest  int64
+	maxResponse int64
 }
 
 // New builds a Proxy. A streaming-friendly HTTP client (no overall timeout) is
@@ -101,9 +123,19 @@ func New(cfg Config) *Proxy {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	return &Proxy{
-		cfg:    cfg,
-		client: &http.Client{Transport: transport, Timeout: 0},
+		cfg:         cfg,
+		client:      &http.Client{Transport: transport, Timeout: 0},
+		maxRequest:  firstPositive(cfg.MaxRequestBytes, maxRequestBody),
+		maxResponse: firstPositive(cfg.MaxResponseBytes, maxResponseBody),
 	}
+}
+
+// firstPositive returns v when it is a usable limit, else def.
+func firstPositive(v, def int64) int64 {
+	if v > 0 {
+		return v
+	}
+	return def
 }
 
 // hop-by-hop headers must not be forwarded (RFC 7230 §6.1).
@@ -113,20 +145,30 @@ var hopHeaders = []string{
 }
 
 const (
-	maxRequestBody  = 32 << 20 // 32 MiB cap when buffering a request body
-	maxResponseBody = 64 << 20 // 64 MiB cap when buffering a non-streaming response
+	maxRequestBody  = 32 << 20 // default request-body cap (Config.MaxRequestBytes)
+	maxResponseBody = 64 << 20 // default buffered-response cap (Config.MaxResponseBytes)
+
+	// maxToolCallBytes bounds the tool-call data held back in Block mode. Past
+	// it the call is no longer buffered: it is replaced with the safety note
+	// and flagged as proto-toolcall-oversized (fail closed, bounded memory).
+	maxToolCallBytes = 8 << 20
 )
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Buffer the request body so we can both inspect it (to learn whether the
-	// client advertised any tools) and forward it upstream.
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
+	// Buffer the request body so we can both inspect it (to learn which tools
+	// the client declared) and forward it upstream. A body over the cap is
+	// rejected outright: forwarding a truncated request would corrupt it.
+	body, err := readBodyLimit(r.Body, p.maxRequest)
 	r.Body.Close()
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			http.Error(w, "holone: request body exceeds the "+humanBytes(p.maxRequest)+" limit", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "holone: read request: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	clientTools := requestDeclaresTools(body)
+	declaredTools := declaredToolNames(body)
 	protocol := detectProtocol(r.URL.Path)
 
 	// Build the upstream request.
@@ -154,43 +196,74 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	st := &streamState{
-		proxy:       p,
-		protocol:    protocol,
-		clientTools: clientTools,
-		path:        r.URL.Path,
+		proxy:         p,
+		protocol:      protocol,
+		declaredTools: declaredTools,
+		path:          r.URL.Path,
 	}
 
-	ct := resp.Header.Get("Content-Type")
-	isSSE := strings.Contains(strings.ToLower(ct), "text/event-stream")
+	isSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+
+	rb, bodyErr := openResponseBody(resp)
+	if bodyErr != nil {
+		var encErr *encodingError
+		errors.As(bodyErr, &encErr)
+		name := "unknown"
+		if encErr != nil {
+			name = encErr.Encoding
+		}
+		if p.cfg.Mode == ModeBlock {
+			// Fail closed: uninspected (and possibly corrupt) bytes must never
+			// reach the client just because the encoding was hostile.
+			st.blocked = true
+			st.streaming = isSSE
+			http.Error(w, "holone: upstream returned unsupported Content-Encoding: "+name+"; response cannot be safely inspected", http.StatusBadGateway)
+			p.report(st)
+			return
+		}
+		// Monitor: forward the bytes untouched with the original encoding and
+		// surface the inspection gap as a finding.
+		st.add(inspect.Finding{
+			RuleID:      inspect.RuleAnomalyEncodingUninspected,
+			Category:    "protocol-anomaly",
+			Severity:    inspect.SevMedium.String(),
+			Match:       "Content-Encoding: " + name,
+			Source:      "protocol",
+			Description: "The upstream used a Content-Encoding holone cannot decode (" + name + "); the body was forwarded uninspected. Use block mode to fail closed.",
+		})
+		rb = bodyStream{r: rb.r, enc: name}
+	}
+	defer rb.Close()
 
 	if isSSE {
-		p.serveStream(w, resp, st)
+		p.serveStream(w, resp, st, rb)
 	} else {
-		p.serveBuffered(w, resp, st)
+		p.serveBuffered(w, resp, st, rb)
 	}
 }
 
 // serveStream copies response headers, then dispatches to a protocol-specific
 // streaming inspector.
-func (p *Proxy) serveStream(w http.ResponseWriter, resp *http.Response, st *streamState) {
+func (p *Proxy) serveStream(w http.ResponseWriter, resp *http.Response, st *streamState, body bodyStream) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		// Cannot stream; fall back to buffered handling.
-		p.serveBuffered(w, resp, st)
+		p.serveBuffered(w, resp, st, body)
 		return
 	}
-	writeResponseHeaders(w, resp, true)
+	st.streaming = true
+	writeResponseHeaders(w, resp, true, body.decoded)
 	w.WriteHeader(resp.StatusCode)
 	flusher.Flush()
 
-	body, closeBody := decompressedBody(resp)
-	defer closeBody()
-	reader := bufio.NewReaderSize(body, 16<<10)
+	reader := bufio.NewReaderSize(body.r, 16<<10)
 	switch st.protocol {
 	case "anthropic":
 		p.streamAnthropic(w, flusher, reader, st)
 	case "openai":
 		p.streamOpenAI(w, flusher, reader, st)
+	case "responses":
+		p.streamResponses(w, flusher, reader, st)
 	default:
 		p.streamGeneric(w, flusher, reader, st)
 	}
@@ -199,33 +272,41 @@ func (p *Proxy) serveStream(w http.ResponseWriter, resp *http.Response, st *stre
 
 // serveBuffered handles non-streaming responses: buffer, inspect, then forward
 // (Monitor) or replace if malicious (Block).
-func (p *Proxy) serveBuffered(w http.ResponseWriter, resp *http.Response, st *streamState) {
-	src, closeBody := decompressedBody(resp)
-	defer closeBody()
-	body, err := io.ReadAll(io.LimitReader(src, maxResponseBody))
+func (p *Proxy) serveBuffered(w http.ResponseWriter, resp *http.Response, st *streamState, body bodyStream) {
+	raw, err := readBodyLimit(body.r, p.maxResponse)
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			http.Error(w, "holone: upstream response exceeds the "+humanBytes(p.maxResponse)+" limit; refusing to forward truncated data", http.StatusBadGateway)
+			return
+		}
 		http.Error(w, "holone: read upstream: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	st.add(p.cfg.Engine.Inspect(string(body), "response-body")...)
-	st.checkAnomaly(bodyMentionsTool(body))
+	st.add(p.cfg.Engine.Inspect(string(raw), "response-body")...)
+	if names := responseToolNames(raw); len(names) > 0 {
+		for _, n := range names {
+			st.checkToolCall(n)
+		}
+	} else {
+		st.checkAnomaly(bodyMentionsTool(raw))
+	}
 
 	blocked := false
 	if p.cfg.Mode == ModeBlock && inspect.MaxSeverity(st.findings) == inspect.SevHigh {
-		body = []byte(`{"type":"error","error":{"type":"holone_blocked","message":"Response blocked by holone: suspected malicious provider injection."}}`)
+		raw = []byte(`{"type":"error","error":{"type":"holone_blocked","message":"Response blocked by holone: suspected malicious provider injection."}}`)
 		blocked = true
 	}
 	st.blocked = blocked
 
-	writeResponseHeaders(w, resp, false)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	writeResponseHeaders(w, resp, false, body.decoded)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(raw)))
 	code := resp.StatusCode
 	if blocked {
 		w.Header().Set("Content-Type", "application/json")
 		code = http.StatusOK
 	}
 	w.WriteHeader(code)
-	w.Write(body)
+	w.Write(raw)
 	p.report(st)
 }
 
@@ -243,9 +324,10 @@ func (p *Proxy) report(st *streamState) {
 		Protocol:    st.protocol,
 		Mode:        p.cfg.Mode.String(),
 		Path:        st.path,
-		ClientTools: st.clientTools,
+		ClientTools: len(st.declaredTools) > 0,
 		Verdict:     verdict,
 		MaxSeverity: inspect.MaxSeverity(st.findings).String(),
+		Protection:  protectionFor(st.protocol, p.cfg.Mode, st.streaming),
 		Findings:    st.findings,
 	}
 	if p.cfg.Logger != nil {
@@ -256,37 +338,145 @@ func (p *Proxy) report(st *streamState) {
 	}
 }
 
-// streamState carries per-request inspection state.
-type streamState struct {
-	proxy       *Proxy
-	protocol    string
-	clientTools bool
-	path        string
-	findings    []inspect.Finding
-	sawTool     bool
-	blocked     bool
+// protectionFor reports how much enforcement is actually possible for this
+// response. Block mode can only rewrite a stream it understands; a buffered
+// body is always fully inspected and can be replaced as a whole.
+func protectionFor(protocol string, mode Mode, streaming bool) string {
+	if mode != ModeBlock {
+		return ProtectionMonitorOnly
+	}
+	if !streaming {
+		return ProtectionProtected
+	}
+	switch protocol {
+	case "anthropic", "openai", "responses":
+		return ProtectionProtected
+	default:
+		return ProtectionUnsupported
+	}
 }
 
+// streamState carries per-request inspection state.
+type streamState struct {
+	proxy         *Proxy
+	protocol      string
+	declaredTools map[string]struct{}
+	path          string
+	findings      []inspect.Finding
+	findingKeys   map[string]struct{}
+	sawTool       bool
+	blocked       bool
+	streaming     bool
+}
+
+// add appends findings, deduplicating by (rule id, match) so overlapping
+// inspection windows and repeated stream events never duplicate a hit.
 func (s *streamState) add(fs ...inspect.Finding) {
-	s.findings = append(s.findings, fs...)
+	if s.findingKeys == nil {
+		s.findingKeys = make(map[string]struct{}, len(fs))
+	}
+	for _, f := range fs {
+		key := f.RuleID + "\x00" + f.Match
+		if _, ok := s.findingKeys[key]; ok {
+			continue
+		}
+		s.findingKeys[key] = struct{}{}
+		s.findings = append(s.findings, f)
+	}
 }
 
 // checkAnomaly adds a high-severity finding if a tool call appeared although
-// the client never advertised any tools — a strong injection signal.
+// the client never advertised any tools — a strong injection signal. Used by
+// paths that can detect a call but not its name (buffered bodies).
 func (s *streamState) checkAnomaly(sawTool bool) {
 	if sawTool {
 		s.sawTool = true
 	}
-	if s.sawTool && !s.clientTools {
-		s.add(inspect.Finding{
-			RuleID:      inspect.RuleAnomalyUnsolicitedTool,
-			Category:    "protocol-anomaly",
-			Severity:    "high",
-			Match:       "tool call present without client-declared tools",
-			Source:      "protocol",
-			Description: "The provider injected a tool call the client never requested.",
-		})
+	if s.sawTool && len(s.declaredTools) == 0 {
+		s.add(unsolicitedToolFinding())
 	}
+}
+
+// checkToolCall validates a returned tool call against the tools the client
+// declared and records a synthetic finding when it is anomalous. It returns the
+// findings it produced so a Block-mode path can decide on them immediately.
+//
+// The provider returning a name the client never declared is just as strong an
+// injection signal as returning any call at all; only the *name* and the
+// declared names are recorded, never the tool arguments.
+func (s *streamState) checkToolCall(name string) []inspect.Finding {
+	s.sawTool = true
+	if len(s.declaredTools) == 0 {
+		f := unsolicitedToolFinding()
+		s.add(f)
+		return []inspect.Finding{f}
+	}
+	if name == "" {
+		return nil
+	}
+	if _, ok := s.declaredTools[name]; ok {
+		return nil
+	}
+	f := inspect.Finding{
+		RuleID:      inspect.RuleAnomalyToolNameNotDeclared,
+		Category:    "protocol-anomaly",
+		Severity:    inspect.SevHigh.String(),
+		Match:       truncate(name, 160),
+		Source:      "protocol",
+		Description: "The provider returned tool call \"" + truncate(name, 160) + "\", which the client never declared. Declared tools: " + declaredList(s.declaredTools) + ".",
+	}
+	s.add(f)
+	return []inspect.Finding{f}
+}
+
+func unsolicitedToolFinding() inspect.Finding {
+	return inspect.Finding{
+		RuleID:      inspect.RuleAnomalyUnsolicitedTool,
+		Category:    "protocol-anomaly",
+		Severity:    inspect.SevHigh.String(),
+		Match:       "tool call present without client-declared tools",
+		Source:      "protocol",
+		Description: "The provider injected a tool call the client never requested.",
+	}
+}
+
+// declaredList renders sorted declared tool names (never arguments) for a
+// finding description.
+func declaredList(names map[string]struct{}) string {
+	out := make([]string, 0, len(names))
+	for n := range names {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	if len(out) == 0 {
+		return "(none)"
+	}
+	return truncate(strings.Join(out, ", "), 300)
+}
+
+// oversizedToolFinding flags a buffered tool call that exceeded
+// maxToolCallBytes and was therefore replaced with a safety note.
+func oversizedToolFinding(name string) inspect.Finding {
+	label := "tool call"
+	if name != "" {
+		label = "tool call \"" + truncate(name, 80) + "\""
+	}
+	return inspect.Finding{
+		RuleID:      inspect.RuleAnomalyOversizedToolCall,
+		Category:    "protocol-anomaly",
+		Severity:    inspect.SevHigh.String(),
+		Match:       label + " exceeded " + humanBytes(maxToolCallBytes),
+		Source:      "protocol",
+		Description: "The provider streamed a " + label + " larger than the " + humanBytes(maxToolCallBytes) + " inspection cap; it could not be verified and was replaced with a safety note.",
+	}
+}
+
+// truncate bounds a finding field (bytes, ASCII-safe for our use).
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "\u2026"
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -295,6 +485,10 @@ func detectProtocol(path string) string {
 	switch {
 	case strings.Contains(path, "/chat/completions"):
 		return "openai"
+	case strings.Contains(path, "/responses"):
+		// OpenAI Responses API (/v1/responses). Checked before /messages so a
+		// provider-side path prefix cannot shadow it.
+		return "responses"
 	case strings.Contains(path, "/messages"):
 		return "anthropic"
 	default:
@@ -302,17 +496,98 @@ func detectProtocol(path string) string {
 	}
 }
 
-// requestDeclaresTools reports whether the request JSON advertised any tools
-// (Anthropic & OpenAI both use "tools"; legacy OpenAI uses "functions").
-func requestDeclaresTools(body []byte) bool {
+// declaredToolNames parses the tool names a request advertises:
+//
+//	Anthropic        tools[].name
+//	OpenAI           tools[].function.name
+//	legacy OpenAI    functions[].name
+//
+// A nil result means the client declared no tools at all.
+func declaredToolNames(body []byte) map[string]struct{} {
 	var m struct {
-		Tools     []json.RawMessage `json:"tools"`
-		Functions []json.RawMessage `json:"functions"`
+		Tools []struct {
+			Name     string `json:"name"`
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+		Functions []struct {
+			Name string `json:"name"`
+		} `json:"functions"`
 	}
 	if err := json.Unmarshal(body, &m); err != nil {
-		return false
+		return nil
 	}
-	return len(m.Tools) > 0 || len(m.Functions) > 0
+	names := make(map[string]struct{}, len(m.Tools)+len(m.Functions))
+	for _, t := range m.Tools {
+		n := t.Name
+		if n == "" {
+			n = t.Function.Name
+		}
+		if n != "" {
+			names[n] = struct{}{}
+		}
+	}
+	for _, f := range m.Functions {
+		if f.Name != "" {
+			names[f.Name] = struct{}{}
+		}
+	}
+	return names
+}
+
+// responseToolNames extracts tool-call names from a buffered (non-streaming)
+// response body so the same declared-name validation that runs on streams also
+// applies to whole-body responses (Anthropic, Chat Completions, legacy
+// function_call, Responses API).
+func responseToolNames(body []byte) []string {
+	var m struct {
+		Content []struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"content"`
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+		FunctionCall struct {
+			Name string `json:"name"`
+		} `json:"function_call"`
+		Output []struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil
+	}
+	var names []string
+	for _, c := range m.Content {
+		if c.Type == "tool_use" && c.Name != "" {
+			names = append(names, c.Name)
+		}
+	}
+	for _, ch := range m.Choices {
+		for _, tc := range ch.Message.ToolCalls {
+			if tc.Function.Name != "" {
+				names = append(names, tc.Function.Name)
+			}
+		}
+	}
+	if m.FunctionCall.Name != "" {
+		names = append(names, m.FunctionCall.Name)
+	}
+	for _, o := range m.Output {
+		if o.Type == "function_call" && o.Name != "" {
+			names = append(names, o.Name)
+		}
+	}
+	return names
 }
 
 // bodyMentionsTool is a coarse check for a tool/function call in a buffered
@@ -333,7 +608,11 @@ func copyHeaders(dst, src http.Header) {
 	dst.Del("Host")
 }
 
-func writeResponseHeaders(w http.ResponseWriter, resp *http.Response, streaming bool) {
+// writeResponseHeaders copies upstream headers to the client. Content-Encoding
+// is stripped only when we actually decoded the body — an encoding we cannot
+// decode is forwarded byte-for-byte, and then the header must be preserved or
+// the client would corrupt the payload.
+func writeResponseHeaders(w http.ResponseWriter, resp *http.Response, streaming, decoded bool) {
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -342,26 +621,14 @@ func writeResponseHeaders(w http.ResponseWriter, resp *http.Response, streaming 
 	for _, h := range hopHeaders {
 		w.Header().Del(h)
 	}
-	// We always forward the body as identity bytes (we decompress upstream gzip
-	// ourselves), so never advertise a Content-Encoding to the client.
-	w.Header().Del("Content-Encoding")
+	if decoded {
+		w.Header().Del("Content-Encoding")
+		w.Header().Del("Content-Length")
+	}
 	if streaming {
 		// Length is unknown for a stream; ensure no stale length is forwarded.
 		w.Header().Del("Content-Length")
 	}
-}
-
-// decompressedBody returns a reader over the response body, transparently
-// gunzipping if the upstream sent gzip despite our identity request (so the
-// inspector sees plaintext and the client receives consistent identity bytes).
-func decompressedBody(resp *http.Response) (io.Reader, func() error) {
-	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
-	if strings.Contains(enc, "gzip") {
-		if gz, err := gzip.NewReader(resp.Body); err == nil {
-			return gz, gz.Close
-		}
-	}
-	return resp.Body, func() error { return nil }
 }
 
 func singleJoin(a, b string) string {
@@ -391,6 +658,3 @@ func (l *Logger) Log(rec any) {
 	l.w.Write(b)
 	l.w.Write([]byte("\n"))
 }
-
-// ensure context import is used even if future edits drop it.
-var _ = context.Background

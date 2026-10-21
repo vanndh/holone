@@ -4,7 +4,7 @@
 // particular AI client.
 //
 //	holone proxy    --upstream <real provider> --listen 127.0.0.1:8787
-//	holone scan     <base-url> [--key KEY]
+//	holone scan     <base-url> [--key KEY] [--protocol auto|chat-completions|responses|anthropic] [--path PATH]
 //	holone audit
 //	holone sentinel [--interval 30s]
 //	holone dashboard [--listen 127.0.0.1:9090]
@@ -33,7 +33,7 @@ import (
 	"github.com/vanndh/holone/internal/sentinel"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -74,7 +74,8 @@ func usage() {
 
 USAGE:
   holone proxy    --upstream <url> [--listen 127.0.0.1:8787] [--mode monitor|block] [--log <file>]
-  holone scan     <base-url> [--key <api-key>] [--model <name>] [--json]
+                  [--max-request-size 32MiB] [--max-response-size 64MiB]
+  holone scan     <base-url> [--key <api-key>] [--model <name>] [--protocol auto|chat-completions|responses|anthropic] [--path <path>] [--json]
   holone audit    [--json]
   holone sentinel [--interval 30s]
   holone dashboard [--listen 127.0.0.1:9090]
@@ -101,6 +102,8 @@ func cmdProxy(args []string) error {
 	logPath := fs.String("log", defaultLogPath(), "audit log file (jsonl); '-' for stdout")
 	rulesPath := fs.String("rules", "", "optional custom rules.json (defaults to built-in)")
 	blockPath := fs.String("blocklist", "", "optional custom blocklist.json (defaults to built-in)")
+	maxReqStr := fs.String("max-request-size", "", "max buffered request body, e.g. 32MiB (default 32MiB)")
+	maxRespStr := fs.String("max-response-size", "", "max buffered response body, e.g. 64MiB (default 64MiB)")
 	fs.Parse(args)
 
 	if *upstream == "" {
@@ -118,6 +121,14 @@ func cmdProxy(args []string) error {
 	if err != nil {
 		return err
 	}
+	maxReq, err := parseByteSize(*maxReqStr)
+	if err != nil {
+		return fmt.Errorf("--max-request-size: %w", err)
+	}
+	maxResp, err := parseByteSize(*maxRespStr)
+	if err != nil {
+		return fmt.Errorf("--max-response-size: %w", err)
+	}
 
 	logw, closeLog, err := openLog(*logPath)
 	if err != nil {
@@ -126,15 +137,20 @@ func cmdProxy(args []string) error {
 	defer closeLog()
 
 	p := proxy.New(proxy.Config{
-		Upstream:   up,
-		Engine:     eng,
-		Mode:       mode,
-		Logger:     proxy.NewLogger(logw),
-		OnDecision: printDecision,
+		Upstream:         up,
+		Engine:           eng,
+		Mode:             mode,
+		Logger:           proxy.NewLogger(logw),
+		OnDecision:       printDecision,
+		MaxRequestBytes:  maxReq,
+		MaxResponseBytes: maxResp,
 	})
 
 	if !officialHost(up.Host) {
 		fmt.Printf("%s⚠  upstream %s is NOT an official Anthropic/OpenAI endpoint — it can read every prompt you send.%s\n", yellow, up.Host, reset)
+	}
+	if mode == proxy.ModeBlock {
+		fmt.Printf("%s⚠  block mode is enforced for anthropic/openai/responses streams and buffered responses; unknown stream protocols run monitor-only (protection=unsupported).%s\n", yellow, reset)
 	}
 	fmt.Printf("%sholone%s proxy listening on http://%s  (mode=%s, rules=%d)\n", bold, reset, *listen, mode, eng.RuleCount())
 	fmt.Printf("  forwarding to %s\n", up.String())
@@ -157,11 +173,16 @@ func cmdScan(args []string) error {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
 	key := fs.String("key", "", "API key (default: $ANTHROPIC_API_KEY)")
 	model := fs.String("model", "", "model name to request")
+	protocol := fs.String("protocol", "auto", "wire protocol: auto | chat-completions | responses | anthropic")
+	pathOverride := fs.String("path", "", "explicit endpoint path override (e.g. /v1/chat/completions)")
 	asJSON := fs.Bool("json", false, "emit JSON report")
 	fs.Parse(normalizeScanArgs(args))
 
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: holone scan <base-url> [--key KEY] [--model NAME] [--json]")
+		return fmt.Errorf("usage: holone scan <base-url> [--key KEY] [--model NAME] [--protocol auto|chat-completions|responses|anthropic] [--path PATH] [--json]")
+	}
+	if _, err := scanner.NormalizeProtocol(*protocol); err != nil {
+		return err
 	}
 	apiKey := *key
 	if apiKey == "" {
@@ -196,6 +217,8 @@ func cmdScan(args []string) error {
 		BaseURL:  fs.Arg(0),
 		APIKey:   apiKey,
 		Model:    *model,
+		Protocol: *protocol,
+		Path:     *pathOverride,
 		Progress: progress,
 	})
 	if err != nil {
@@ -420,6 +443,11 @@ func printDecision(d proxy.Decision) {
 		fmt.Printf(" %s", f.RuleID)
 	}
 	fmt.Println()
+	// Enforcement gaps must be visible to the operator, not only in the jsonl
+	// log: "protected" is the expected state and stays quiet.
+	if d.Protection != "" && d.Protection != proxy.ProtectionProtected {
+		fmt.Printf("  %s[protection=%s]%s\n", yellow, d.Protection, reset)
+	}
 }
 
 func printScan(r *scanner.Result) {
@@ -437,6 +465,16 @@ func printScan(r *scanner.Result) {
 		fmt.Printf("\n  %sIOC HITS / СОВПАДЕНИЯ IOC%s\n", red+bold, reset)
 		for _, h := range r.BlocklistHits {
 			fmt.Printf("    %s● %s%s\n", red, h, reset)
+		}
+	}
+	if len(r.Discovery) > 0 {
+		fmt.Printf("\n  %sProtocols / Протоколы%s  (mode: %s)\n", bold, reset, r.Protocol)
+		for _, d := range r.Discovery {
+			label, col := "supported / поддерживается", green
+			if !d.Supported {
+				label, col = "not supported / не поддерживается", dim
+			}
+			fmt.Printf("    %-18s %s%-36s%s %s%s%s\n", d.Protocol, col, label, reset, dim, d.Endpoint, reset)
 		}
 	}
 

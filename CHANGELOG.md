@@ -4,6 +4,56 @@
 [keep a changelog](https://keepachangelog.com/), версионирование стремится
 следовать [semver](https://semver.org/).
 
+## [0.4.0] — unreleased
+
+хардненинг прокси, инспекции и поставки: закрыты обходы лимитов, слепые зоны
+стрима и непроверенные кодировки, добавлена нативная поддержка OpenAI Responses.
+
+### безопасность
+
+фиксы #2–#8:
+
+- **cap bypass** — лимиты тел больше нельзя обойти незаметно: превышение
+  request → `413`, response → `502`; тела не усекаются молча.
+- **declared tool names** — если клиент объявил инструменты, но провайдер вернул
+  имя, которого не было в запросе → high `proto-tool-name-not-declared`,
+  в block-режиме блокируется. для ответов без объявленных инструментов остаётся
+  прежний `proto-tooluse-unsolicited`.
+- **redaction** — `Finding.Match` / `Excerpt` маскируются перед записью в лог и
+  дашборд: telegram / discord / slack webhooks, `Bearer`, `sk-…`, `xox…`,
+  `ghp_…`, `AKIA…`. детект по-прежнему идёт по сырому тексту.
+- **unsupported encodings** — `br`, `zstd` и неизвестные `Content-Encoding`
+  в block-режиме дают `502` (fail-closed), в monitor проходят как есть
+  с сохранённым заголовком и medium `proto-encoding-uninspected`.
+- **oversized bodies / tool calls** — буфер tool-call в block-режиме ограничен
+  8 MiB: превышение fail-closed, вызов заменяется безопасной заметкой и
+  high-finding `proto-toolcall-oversized`.
+- **Responses API block** — `/v1/responses` парсится нативно; вредоносный
+  `function_call` в block-режиме рвёт стрим через `event: error` (fail-closed).
+  неизвестные stream-протоколы в block-режиме не выдают за защищённые: поток
+  идёт monitor-only, решение помечается `protection: unsupported`.
+- **scanner url** — base url нормализуется, `/v1/v1` больше не появляется;
+  протокол, путь и модель задаются явно.
+- **installer checksums** — `install.sh` / `install.ps1` сверяют sha-256 по
+  `SHA256SUMS.txt` того же релиза до установки; при несовпадении или отсутствии
+  записи — ошибка и отказ без установки.
+
+### добавлено
+
+- флаги `--max-request-size` / `--max-response-size` (байты или `KiB` / `MiB` /
+  `GiB`; дефолты 32 MiB / 64 MiB).
+- поле `protection` (`protected` | `monitor-only` | `unsupported`) в jsonl-логе
+  решений.
+- `holone scan`: флаги `--protocol auto|chat-completions|responses|anthropic`,
+  `--path`, `--model`; auto-discovery печатает поддерживаемые layout'ы endpoint.
+- нативная поддержка OpenAI Responses API (`/v1/responses`) в прокси и сканере.
+
+### изменено
+
+- инспекция стрима — rolling-окна 256 KiB с перекрытием 8 KiB по всему ответу
+  вместо кэпа в 1 MiB; слепой зоны после 1 MiB больше нет.
+- версия 0.4.0.
+
 ## [0.3.0] — 2026-07-08
 
 ### добавлено
@@ -156,6 +206,7 @@
   вредоносного провайдера (`mockevil`), бенчмарки латентности и ci под
   windows/macos/linux.
 
+[0.4.0]: https://github.com/vanndh/holone/releases/tag/v0.4.0
 [0.3.0]: https://github.com/vanndh/holone/releases/tag/v0.3.0
 [0.2.0]: https://github.com/vanndh/holone/releases/tag/v0.2.0
 [0.1.0]: https://github.com/vanndh/holone/releases/tag/v0.1.0

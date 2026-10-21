@@ -33,10 +33,11 @@ func (p *Proxy) streamAnthropic(w http.ResponseWriter, flusher http.Flusher, r *
 		return
 	}
 
-	// Monitor: forward each line immediately, inspect a copy.
-	toolName := map[int]string{}
-	toolBuf := map[int]*strings.Builder{}
-	var textBuf strings.Builder
+	// Monitor: forward each line immediately, inspect a copy. Inspection runs
+	// over the whole stream in rolling windows, so a payload placed past the
+	// old 1 MiB cap cannot slip through.
+	toolBuf := map[int]*streamInspector{}
+	text := newStreamInspector(p.cfg.Engine, "text")
 
 	onLine := func(b []byte) error { return writeAndFlush(w, flusher, b) }
 	onEvent := func(ev sseEvent) error {
@@ -47,24 +48,22 @@ func (p *Proxy) streamAnthropic(w http.ResponseWriter, flusher http.Flusher, r *
 		switch ae.Type {
 		case "content_block_start":
 			if ae.ContentBlock.Type == "tool_use" {
-				st.sawTool = true
-				toolName[ae.Index] = ae.ContentBlock.Name
-				toolBuf[ae.Index] = &strings.Builder{}
+				st.checkToolCall(ae.ContentBlock.Name)
+				toolBuf[ae.Index] = newStreamInspector(p.cfg.Engine, "tool_use:"+ae.ContentBlock.Name)
 			}
 		case "content_block_delta":
 			switch ae.Delta.Type {
 			case "input_json_delta":
-				if b := toolBuf[ae.Index]; b != nil {
-					capWrite(b, ae.Delta.PartialJSON)
+				if si := toolBuf[ae.Index]; si != nil {
+					si.Write(ae.Delta.PartialJSON)
 				}
 			case "text_delta":
-				capWrite(&textBuf, ae.Delta.Text)
+				text.Write(ae.Delta.Text)
 			}
 		case "content_block_stop":
-			if b := toolBuf[ae.Index]; b != nil {
-				st.add(p.cfg.Engine.Inspect(b.String(), "tool_use:"+toolName[ae.Index])...)
+			if si := toolBuf[ae.Index]; si != nil {
+				st.add(si.Finish()...)
 				delete(toolBuf, ae.Index)
-				delete(toolName, ae.Index)
 			}
 		case "error":
 			st.add(p.cfg.Engine.Inspect(ev.data, "error-frame")...)
@@ -74,49 +73,62 @@ func (p *Proxy) streamAnthropic(w http.ResponseWriter, flusher http.Flusher, r *
 
 	_ = readSSE(r, onLine, onEvent)
 	// Inspect any tool blocks that never received content_block_stop (truncation).
-	for idx, b := range toolBuf {
-		st.add(p.cfg.Engine.Inspect(b.String(), "tool_use:"+toolName[idx])...)
+	for _, si := range toolBuf {
+		st.add(si.Finish()...)
 	}
-	st.add(p.cfg.Engine.Inspect(textBuf.String(), "text")...)
-	st.checkAnomaly(false)
+	st.add(text.Finish()...)
 }
 
 // streamAnthropicBlock forwards text immediately but holds back tool_use blocks
-// until verified, replacing malicious or unsolicited ones with a safe note.
+// until verified, replacing malicious, undersized, oversized or undeclared ones
+// with a safe note.
 func (p *Proxy) streamAnthropicBlock(w http.ResponseWriter, flusher http.Flusher, r *bufio.Reader, st *streamState) {
-	var textBuf strings.Builder
+	text := newStreamInspector(p.cfg.Engine, "text")
 
 	buffering := false
 	var bufIndex int
 	var bufName string
 	var bufRaw [][]byte
-	var bufInput strings.Builder
+	var bufBytes int
+	var bufInspect *streamInspector
+	var nameFindings []inspect.Finding
+	oversized := false
 	droppedTool := false
 
 	emit := func(b []byte) error { return writeAndFlush(w, flusher, b) }
 
 	// finalizeTool inspects the buffered tool_use block and either flushes it
-	// (clean) or replaces it with a safe note (malicious / unsolicited). Used at
-	// content_block_stop and again at EOF for a truncated, never-stopped block.
+	// (clean) or replaces it with a safe note (malicious / undeclared /
+	// oversized). Used at content_block_stop and again at EOF for a truncated,
+	// never-stopped block.
 	finalizeTool := func() error {
-		findings := p.cfg.Engine.Inspect(bufInput.String(), "tool_use:"+bufName)
+		findings := bufInspect.Finish()
 		st.add(findings...)
-		drop := inspect.MaxSeverity(findings) == inspect.SevHigh || !st.clientTools
+		drop := inspect.MaxSeverity(findings) == inspect.SevHigh ||
+			inspect.MaxSeverity(nameFindings) == inspect.SevHigh ||
+			len(st.declaredTools) == 0 || oversized
 		buffering = false
-		if drop {
-			droppedTool = true
-			reason := "unsolicited tool call"
-			if len(findings) > 0 {
-				reason = findings[0].RuleID
+		if !drop {
+			for _, raw := range bufRaw {
+				if e := emit(raw); e != nil {
+					return e
+				}
 			}
-			return emitAnthropicNote(w, flusher, bufIndex, reason)
+			return nil
 		}
-		for _, raw := range bufRaw {
-			if e := emit(raw); e != nil {
-				return e
-			}
+		droppedTool = true
+		reason := "unsolicited tool call"
+		switch {
+		case oversized:
+			f := oversizedToolFinding(bufName)
+			st.add(f)
+			reason = f.RuleID
+		case len(findings) > 0:
+			reason = findings[0].RuleID
+		case len(nameFindings) > 0:
+			reason = nameFindings[0].RuleID
 		}
-		return nil
+		return emitAnthropicNote(w, flusher, bufIndex, reason)
 	}
 
 	onEvent := func(ev sseEvent) error {
@@ -126,9 +138,23 @@ func (p *Proxy) streamAnthropicBlock(w http.ResponseWriter, flusher http.Flusher
 		}
 
 		if buffering {
-			bufRaw = append(bufRaw, ev.raw)
+			delta := ""
 			if ae.Type == "content_block_delta" && ae.Delta.Type == "input_json_delta" {
-				capWrite(&bufInput, ae.Delta.PartialJSON)
+				delta = ae.Delta.PartialJSON
+			}
+			if !oversized {
+				bufBytes += len(ev.raw) + len(delta)
+				if bufBytes > maxToolCallBytes {
+					// Fail closed: stop retaining the call, keep consuming the
+					// stream until the block closes so the client stream stays
+					// well-formed, and drop it at finalize.
+					oversized = true
+					bufRaw = nil
+					bufBytes = 0
+				} else {
+					bufRaw = append(bufRaw, ev.raw)
+					bufInspect.Write(delta)
+				}
 			}
 			if ae.Type == "content_block_stop" && ae.Index == bufIndex {
 				return finalizeTool()
@@ -139,17 +165,19 @@ func (p *Proxy) streamAnthropicBlock(w http.ResponseWriter, flusher http.Flusher
 		switch ae.Type {
 		case "content_block_start":
 			if ae.ContentBlock.Type == "tool_use" {
-				st.sawTool = true
 				buffering = true
 				bufIndex = ae.Index
 				bufName = ae.ContentBlock.Name
 				bufRaw = [][]byte{ev.raw}
-				bufInput.Reset()
+				bufBytes = len(ev.raw)
+				bufInspect = newStreamInspector(p.cfg.Engine, "tool_use:"+bufName)
+				nameFindings = st.checkToolCall(bufName)
+				oversized = false
 				return nil
 			}
 		case "content_block_delta":
 			if ae.Delta.Type == "text_delta" {
-				capWrite(&textBuf, ae.Delta.Text)
+				text.Write(ae.Delta.Text)
 			}
 		case "message_delta":
 			if droppedTool && ae.Delta.StopReason == "tool_use" {
@@ -167,8 +195,7 @@ func (p *Proxy) streamAnthropicBlock(w http.ResponseWriter, flusher http.Flusher
 	if buffering {
 		_ = finalizeTool()
 	}
-	st.add(p.cfg.Engine.Inspect(textBuf.String(), "text")...)
-	st.checkAnomaly(false)
+	st.add(text.Finish()...)
 	if droppedTool {
 		st.blocked = true
 	}
