@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	latestReleaseURL = "https://api.github.com/repos/vanndh/holone/releases/latest"
-	updateCacheTTL   = 12 * time.Hour
+	latestReleaseURL     = "https://api.github.com/repos/vanndh/holone/releases/latest"
+	updateCacheTTL       = 12 * time.Hour
+	updateFailureBackoff = 2 * time.Hour
 )
 
 type githubRelease struct {
@@ -23,8 +24,9 @@ type githubRelease struct {
 }
 
 type updateCache struct {
-	CheckedAt time.Time     `json:"checked_at"`
-	Release   githubRelease `json:"release"`
+	CheckedAt time.Time     `json:"checked_at,omitempty"`
+	FailedAt  time.Time     `json:"failed_at,omitempty"`
+	Release   githubRelease `json:"release,omitempty"`
 }
 
 func checkForUpdate(args []string) {
@@ -32,22 +34,47 @@ func checkForUpdate(args []string) {
 		return
 	}
 	cachePath := defaultUpdateCachePath()
-	if release, ok := readFreshUpdateCache(cachePath, updateCacheTTL); ok {
+	if release, fresh, recentlyFailed := readUpdateCacheState(cachePath, updateCacheTTL, updateFailureBackoff); fresh {
 		if notice := updateNotice(release, version); notice != "" {
 			fmt.Fprint(os.Stderr, notice)
 		}
 		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	release, err := fetchLatestGitHubRelease(ctx, http.DefaultClient, latestReleaseURL)
-	if err != nil {
+	} else if recentlyFailed {
 		return
 	}
-	_ = writeUpdateCache(cachePath, release, time.Now())
-	if notice := updateNotice(release, version); notice != "" {
-		fmt.Fprint(os.Stderr, notice)
+
+	run := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		release, err := fetchLatestGitHubRelease(ctx, http.DefaultClient, latestReleaseURL)
+		if err != nil {
+			_ = writeFailedUpdateCache(cachePath, time.Now())
+			return
+		}
+		_ = writeUpdateCache(cachePath, release, time.Now())
+		if notice := updateNotice(release, version); notice != "" {
+			fmt.Fprint(os.Stderr, notice)
+		}
+	}
+
+	// Long-lived server commands run the network check asynchronously so
+	// offline startups never wait on the 2-second timeout.
+	if isLongLivedCommand(argsWithoutUpdateFlag(args)) {
+		go run()
+		return
+	}
+	run()
+}
+
+func isLongLivedCommand(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	switch args[1] {
+	case "proxy", "dashboard", "sentinel":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -56,7 +83,14 @@ func updateCheckDisabled(args []string) bool {
 		return true
 	}
 	for _, arg := range args[1:] {
-		if arg == "--no-update-check" {
+		if arg == "--no-update-check" || arg == "--json" {
+			return true
+		}
+	}
+	cleaned := argsWithoutUpdateFlag(append([]string(nil), args...))
+	if len(cleaned) >= 2 {
+		switch cleaned[1] {
+		case "version", "--version", "-v", "help", "--help", "-h":
 			return true
 		}
 	}
@@ -64,7 +98,7 @@ func updateCheckDisabled(args []string) bool {
 }
 
 func argsWithoutUpdateFlag(args []string) []string {
-	out := args[:0]
+	out := make([]string, 0, len(args))
 	for _, arg := range args {
 		if arg != "--no-update-check" {
 			out = append(out, arg)
@@ -87,18 +121,26 @@ func defaultUpdateCachePath() string {
 }
 
 func readFreshUpdateCache(path string, ttl time.Duration) (githubRelease, bool) {
+	rel, ok, _ := readUpdateCacheState(path, ttl, 0)
+	return rel, ok
+}
+
+func readUpdateCacheState(path string, ttl, backoff time.Duration) (release githubRelease, freshOK bool, recentlyFailed bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return githubRelease{}, false
+		return githubRelease{}, false, false
 	}
 	var cache updateCache
 	if err := json.Unmarshal(data, &cache); err != nil {
-		return githubRelease{}, false
+		return githubRelease{}, false, false
+	}
+	if backoff > 0 && !cache.FailedAt.IsZero() && time.Since(cache.FailedAt) <= backoff {
+		return cache.Release, false, true
 	}
 	if strings.TrimSpace(cache.Release.TagName) == "" || time.Since(cache.CheckedAt) > ttl {
-		return githubRelease{}, false
+		return githubRelease{}, false, false
 	}
-	return cache.Release, true
+	return cache.Release, true, false
 }
 
 func writeUpdateCache(path string, release githubRelease, checkedAt time.Time) error {
@@ -109,6 +151,25 @@ func writeUpdateCache(path string, release githubRelease, checkedAt time.Time) e
 		return err
 	}
 	data, err := json.MarshalIndent(updateCache{CheckedAt: checkedAt.UTC(), Release: release}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func writeFailedUpdateCache(path string, failedAt time.Time) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	var cache updateCache
+	if existing, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(existing, &cache)
+	}
+	cache.FailedAt = failedAt.UTC()
+	data, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
 		return err
 	}

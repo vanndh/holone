@@ -18,13 +18,14 @@ import (
 // handler, which can only observe — so Block mode silently degraded to
 // monitor-only. The events that matter here are:
 //
-//	response.output_item.added            item.type=="function_call", item.name, item.call_id
+//	response.output_item.added            item.type=="function_call" (or mcp/shell/computer/custom call)
 //	response.function_call_arguments.delta  streamed argument fragment (delta)
 //	response.function_call_arguments.done   final argument string
-//	response.output_item.done             complete item (arguments included)
+//	response.output_item.done             complete item (arguments/action/command included)
 //	response.completed                    final response with the full output[]
 //
-// Arguments are accumulated and inspected exactly like the other protocols.
+// Arguments are accumulated and inspected in both delta and final events so
+// a hostile server cannot send benign deltas and swap a payload into *.done.
 
 // errResponsesBlocked stops the stream after holone emitted a fail-closed
 // error event for the Responses API.
@@ -38,31 +39,72 @@ type responsesEvent struct {
 	OutputIndex int           `json:"output_index"`
 	Delta       string        `json:"delta"`
 	Arguments   string        `json:"arguments"`
+	Input       string        `json:"input"`
+	Text        string        `json:"text"`
 	Response    struct {
 		Output []responsesItem `json:"output"`
 	} `json:"response"`
 }
 
 type responsesItem struct {
-	ID        string `json:"id"`
-	Type      string `json:"type"`
-	Name      string `json:"name"`
-	CallID    string `json:"call_id"`
-	Arguments string `json:"arguments"`
+	ID        string          `json:"id"`
+	Type      string          `json:"type"`
+	Name      string          `json:"name"`
+	CallID    string          `json:"call_id"`
+	Arguments string          `json:"arguments"`
+	Input     json.RawMessage `json:"input"`
+	Action    json.RawMessage `json:"action"`
+	Command   json.RawMessage `json:"command"`
+	Code      string          `json:"code"`
 }
 
-// responsesCall tracks one streamed function_call item.
+func isResponsesToolItem(t string) bool {
+	switch t {
+	case "function_call", "mcp_call", "local_shell_call", "shell_call",
+		"computer_call", "custom_tool_call", "code_interpreter_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func itemCheckName(item responsesItem) string {
+	if item.Name != "" {
+		return item.Name
+	}
+	return item.Type
+}
+
+func itemPayload(item responsesItem) string {
+	if item.Arguments != "" {
+		return item.Arguments
+	}
+	var parts []string
+	for _, raw := range []json.RawMessage{item.Input, item.Action, item.Command} {
+		s := strings.TrimSpace(string(raw))
+		if s != "" && s != "null" && s != "{}" {
+			parts = append(parts, s)
+		}
+	}
+	if item.Code != "" {
+		parts = append(parts, item.Code)
+	}
+	return strings.Join(parts, "\n")
+}
+
+// responsesCall tracks one streamed tool-call item.
 type responsesCall struct {
-	name      string
-	insp      *streamInspector
-	raw       [][]byte // withheld frames, replayed on the clean path
-	bytes     int
-	gotDelta  bool
-	oversized bool
+	name          string
+	insp          *streamInspector
+	extraFindings []inspect.Finding
+	raw           [][]byte // withheld frames, replayed on the clean path
+	bytes         int
+	gotDelta      bool
+	oversized     bool
 }
 
 func newResponsesCall(eng *inspect.Engine, name string) *responsesCall {
-	return &responsesCall{name: name, insp: newStreamInspector(eng, "tool_call:"+name)}
+	return &responsesCall{name: name, insp: newToolStreamInspector(eng, "tool_call:"+name, name)}
 }
 
 func parseResponses(ev sseEvent) (responsesEvent, bool) {
@@ -77,8 +119,8 @@ func parseResponses(ev sseEvent) (responsesEvent, bool) {
 	return re, true
 }
 
-// responsesKey identifies the function_call item an event belongs to. Deltas
-// carry item_id, item events carry item.id; output_index is the fallback.
+// responsesKey identifies the tool-call item an event belongs to. Deltas carry
+// item_id, item events carry item.id; output_index is the fallback.
 func responsesKey(re responsesEvent) string {
 	if re.Item.ID != "" {
 		return re.Item.ID
@@ -99,6 +141,17 @@ func (p *Proxy) streamResponses(w http.ResponseWriter, flusher http.Flusher, r *
 	calls := map[string]*responsesCall{}
 	text := newStreamInspector(p.cfg.Engine, "text")
 
+	inspectDonePayload := func(c *responsesCall, payload string) {
+		if payload == "" {
+			return
+		}
+		if !c.gotDelta {
+			c.insp.Write(payload)
+			return
+		}
+		st.add(p.cfg.Engine.InspectToolArgs(c.name, payload, "tool_call:"+c.name)...)
+	}
+
 	onLine := func(b []byte) error { return writeAndFlush(w, flusher, b) }
 	onEvent := func(ev sseEvent) error {
 		re, ok := parseResponses(ev)
@@ -107,53 +160,70 @@ func (p *Proxy) streamResponses(w http.ResponseWriter, flusher http.Flusher, r *
 		}
 		switch re.Type {
 		case "response.output_item.added":
-			if re.Item.Type == "function_call" {
-				st.checkToolCall(re.Item.Name)
-				c := newResponsesCall(p.cfg.Engine, re.Item.Name)
-				c.insp.Write(re.Item.Arguments)
+			if isResponsesToolItem(re.Item.Type) {
+				name := itemCheckName(re.Item)
+				st.checkToolCall(name)
+				c := newResponsesCall(p.cfg.Engine, name)
+				if payload := itemPayload(re.Item); payload != "" {
+					c.insp.Write(payload)
+				}
 				calls[responsesKey(re)] = c
 			}
-		case "response.function_call_arguments.delta":
+		case "response.function_call_arguments.delta", "response.mcp_call_arguments.delta", "response.custom_tool_call_input.delta":
 			if c := calls[responsesKey(re)]; c != nil {
 				c.gotDelta = true
 				c.insp.Write(re.Delta)
 			}
-		case "response.function_call_arguments.done":
-			if c := calls[responsesKey(re)]; c != nil && !c.gotDelta {
-				c.insp.Write(re.Arguments)
+		case "response.function_call_arguments.done", "response.mcp_call_arguments.done":
+			if c := calls[responsesKey(re)]; c != nil {
+				inspectDonePayload(c, re.Arguments)
+			}
+		case "response.custom_tool_call_input.done":
+			if c := calls[responsesKey(re)]; c != nil {
+				inspectDonePayload(c, re.Input)
 			}
 		case "response.output_item.done":
-			if re.Item.Type == "function_call" {
+			if isResponsesToolItem(re.Item.Type) {
 				key := responsesKey(re)
+				name := itemCheckName(re.Item)
 				c := calls[key]
 				if c == nil {
-					st.checkToolCall(re.Item.Name)
-					c = newResponsesCall(p.cfg.Engine, re.Item.Name)
+					st.checkToolCall(name)
+					c = newResponsesCall(p.cfg.Engine, name)
 					calls[key] = c
 				}
-				if !c.gotDelta && re.Item.Arguments != "" {
-					c.insp.Write(re.Item.Arguments)
+				if name != "" && c.name != name {
+					c.name = name
+					c.insp.SetToolName(name)
+					st.checkToolCall(name)
 				}
+				inspectDonePayload(c, itemPayload(re.Item))
 				st.add(c.insp.Finish()...)
 				delete(calls, key)
 			}
 		case "response.completed":
 			for _, item := range re.Response.Output {
-				if item.Type != "function_call" {
+				if !isResponsesToolItem(item.Type) {
 					continue
 				}
+				name := itemCheckName(item)
+				payload := itemPayload(item)
 				key := item.ID
 				if c, ok := calls[key]; ok {
+					inspectDonePayload(c, payload)
 					st.add(c.insp.Finish()...)
 					delete(calls, key)
 					continue
 				}
-				// A call reported only in the final frame was not streamed.
-				st.checkToolCall(item.Name)
-				st.add(p.cfg.Engine.Inspect(item.Arguments, "tool_call:"+item.Name)...)
+				// A call reported only in the final frame (or already closed
+				// earlier) still has its final payload verified.
+				st.checkToolCall(name)
+				st.add(p.cfg.Engine.InspectToolArgs(name, payload, "tool_call:"+name)...)
 			}
-		case "response.output_text.delta":
+		case "response.output_text.delta", "response.reasoning_summary_text.delta":
 			text.Write(re.Delta)
+		case "response.output_text.done":
+			text.Write(re.Text)
 		case "error", "response.failed":
 			st.add(p.cfg.Engine.Inspect(ev.data, "error-frame")...)
 		}
@@ -167,12 +237,10 @@ func (p *Proxy) streamResponses(w http.ResponseWriter, flusher http.Flusher, r *
 	st.add(text.Finish()...)
 }
 
-// streamResponsesBlock fails closed: a function_call item is withheld until its
+// streamResponsesBlock fails closed: a tool-call item is withheld until its
 // arguments are fully inspected, and if it is malicious or undeclared the call
 // is never emitted. We then emit a Responses-style `error` SSE event and stop
 // forwarding, so the client fails the turn instead of executing the call.
-// (The Responses API reports mid-stream failures as `event: error` frames; this
-// is the documented fail-closed shape rather than a risky in-place rewrite.)
 func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher, r *bufio.Reader, st *streamState) {
 	calls := map[string]*responsesCall{}
 	text := newStreamInspector(p.cfg.Engine, "text")
@@ -181,10 +249,10 @@ func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher
 
 	emit := func(b []byte) error { return writeAndFlush(w, flusher, b) }
 
-	// finalizeCall inspects a withheld function call and either replays its
-	// frames (clean, declared) or emits a terminal error event.
+	// finalizeCall inspects a withheld call and either replays its frames
+	// (clean, declared) or emits a terminal error event.
 	finalizeCall := func(c *responsesCall) error {
-		findings := c.insp.Finish()
+		findings := append(c.insp.Finish(), c.extraFindings...)
 		st.add(findings...)
 		drop := inspect.MaxSeverity(findings) == inspect.SevHigh ||
 			inspect.MaxSeverity(st.findings) == inspect.SevHigh ||
@@ -198,6 +266,7 @@ func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher
 			return nil
 		}
 		dropped = true
+		terminated = true
 		reason := "unsolicited tool call"
 		switch {
 		case c.oversized:
@@ -205,7 +274,7 @@ func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher
 			st.add(f)
 			reason = f.RuleID
 		case len(findings) > 0:
-			reason = findings[0].RuleID
+			reason = firstRuleID(findings)
 		default:
 			for _, f := range st.findings {
 				if f.Severity == inspect.SevHigh.String() {
@@ -237,6 +306,19 @@ func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher
 		c.insp.Write(delta)
 	}
 
+	// bufferDonePayload always verifies final arguments on *.done even when
+	// streaming deltas were already seen (defeats split-view bypass).
+	bufferDonePayload := func(c *responsesCall, raw []byte, payload string) {
+		if !c.gotDelta {
+			buffered(c, raw, payload)
+			return
+		}
+		buffered(c, raw, "")
+		if payload != "" {
+			c.extraFindings = append(c.extraFindings, p.cfg.Engine.InspectToolArgs(c.name, payload, "tool_call:"+c.name)...)
+		}
+	}
+
 	onEvent := func(ev sseEvent) error {
 		re, ok := parseResponses(ev)
 		if !ok {
@@ -244,14 +326,15 @@ func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher
 		}
 		switch re.Type {
 		case "response.output_item.added":
-			if re.Item.Type == "function_call" {
-				c := newResponsesCall(p.cfg.Engine, re.Item.Name)
-				st.checkToolCall(re.Item.Name)
-				buffered(c, ev.raw, re.Item.Arguments)
+			if isResponsesToolItem(re.Item.Type) {
+				name := itemCheckName(re.Item)
+				c := newResponsesCall(p.cfg.Engine, name)
+				st.checkToolCall(name)
+				buffered(c, ev.raw, itemPayload(re.Item))
 				calls[responsesKey(re)] = c
 				return nil // withheld until resolved
 			}
-		case "response.function_call_arguments.delta":
+		case "response.function_call_arguments.delta", "response.mcp_call_arguments.delta", "response.custom_tool_call_input.delta":
 			key := responsesKey(re)
 			c := calls[key]
 			if c == nil {
@@ -264,7 +347,7 @@ func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher
 			c.gotDelta = true
 			buffered(c, ev.raw, re.Delta)
 			return nil
-		case "response.function_call_arguments.done":
+		case "response.function_call_arguments.done", "response.mcp_call_arguments.done":
 			key := responsesKey(re)
 			c := calls[key]
 			if c == nil {
@@ -272,43 +355,46 @@ func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher
 				st.checkToolCall("")
 				calls[key] = c
 			}
-			if !c.gotDelta {
-				buffered(c, ev.raw, re.Arguments)
-			} else {
-				buffered(c, ev.raw, "")
+			bufferDonePayload(c, ev.raw, re.Arguments)
+			return nil
+		case "response.custom_tool_call_input.done":
+			key := responsesKey(re)
+			c := calls[key]
+			if c == nil {
+				c = newResponsesCall(p.cfg.Engine, "")
+				st.checkToolCall("")
+				calls[key] = c
 			}
+			bufferDonePayload(c, ev.raw, re.Input)
 			return nil
 		case "response.output_item.done":
-			if re.Item.Type == "function_call" {
+			if isResponsesToolItem(re.Item.Type) {
 				key := responsesKey(re)
+				name := itemCheckName(re.Item)
 				c := calls[key]
 				if c == nil {
-					c = newResponsesCall(p.cfg.Engine, re.Item.Name)
-					st.checkToolCall(re.Item.Name)
+					c = newResponsesCall(p.cfg.Engine, name)
+					st.checkToolCall(name)
 					calls[key] = c
 				}
-				if re.Item.Name != "" && c.name != re.Item.Name {
-					c.name = re.Item.Name
+				if name != "" && c.name != name {
+					c.name = name
+					c.insp.SetToolName(name)
 					st.checkToolCall(c.name)
 				}
-				if !c.gotDelta && re.Item.Arguments != "" {
-					buffered(c, ev.raw, re.Item.Arguments)
-				} else {
-					buffered(c, ev.raw, "")
-				}
+				bufferDonePayload(c, ev.raw, itemPayload(re.Item))
 				delete(calls, key)
 				return finalizeCall(c)
 			}
 		case "response.completed":
-			// Resolve calls reported only in the final frame (servers that do
-			// not stream per-item events). A malicious call here still fails
-			// the stream closed, though earlier frames may have been forwarded.
+			// Resolve calls reported only in the final frame (or verify final
+			// output[] items against any streamed calls).
 			for i, item := range re.Response.Output {
-				if item.Type != "function_call" {
+				if !isResponsesToolItem(item.Type) {
 					continue
 				}
-				// Match the streamed call by item id, falling back to the
-				// output index when the server omits ids in the final frame.
+				name := itemCheckName(item)
+				payload := itemPayload(item)
 				var c *responsesCall
 				for _, key := range []string{item.ID, "#" + strconv.Itoa(i)} {
 					if cc, ok := calls[key]; ok {
@@ -318,24 +404,30 @@ func (p *Proxy) streamResponsesBlock(w http.ResponseWriter, flusher http.Flusher
 					}
 				}
 				if c != nil {
+					if payload != "" {
+						c.extraFindings = append(c.extraFindings, p.cfg.Engine.InspectToolArgs(c.name, payload, "tool_call:"+c.name)...)
+					}
 					if err := finalizeCall(c); err != nil {
 						return err
 					}
 					continue
 				}
-				findings := p.cfg.Engine.Inspect(item.Arguments, "tool_call:"+item.Name)
+				findings := p.cfg.Engine.InspectToolArgs(name, payload, "tool_call:"+name)
 				st.add(findings...)
-				nameFindings := st.checkToolCall(item.Name)
+				nameFindings := st.checkToolCall(name)
 				if inspect.MaxSeverity(append(findings, nameFindings...)) == inspect.SevHigh || len(st.declaredTools) == 0 {
 					dropped = true
+					terminated = true
 					if e := emit(responsesErrorFrame(firstRuleID(findings, nameFindings))); e != nil {
 						return e
 					}
 					return errResponsesBlocked
 				}
 			}
-		case "response.output_text.delta":
+		case "response.output_text.delta", "response.reasoning_summary_text.delta":
 			text.Write(re.Delta)
+		case "response.output_text.done":
+			text.Write(re.Text)
 		case "error", "response.failed":
 			st.add(p.cfg.Engine.Inspect(ev.data, "error-frame")...)
 		}
@@ -394,6 +486,11 @@ func firstRuleID(lists ...[]inspect.Finding) string {
 			if f.Severity == inspect.SevHigh.String() {
 				return f.RuleID
 			}
+		}
+	}
+	for _, fs := range lists {
+		if len(fs) > 0 {
+			return fs[0].RuleID
 		}
 	}
 	return "proto-tooluse-unsolicited"

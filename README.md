@@ -169,15 +169,21 @@ holone proxy --upstream <url-провайдера> [--listen 127.0.0.1:8787] [--
 | латентность | ~0 (инспекция вне горячего пути) | ~0 для текста; задержка лишь на подозрительном `tool_use` |
 | чистый текст | не трогается | не трогается |
 
-флаги: `--log <файл|->` (jsonl-лог, по умолчанию `~/.holone/holone.log`),
-`--rules <файл>` / `--blocklist <файл>` — заменить встроенные правила,
-`--max-request-size` / `--max-response-size` — лимиты тел (байты или `KiB`/`MiB`/`GiB`;
+флаги: `--protocol auto|anthropic|openai|responses|gemini` (автоопределение
+включая Google Gemini `:streamGenerateContent`), `--egress-dlp off|warn|block|redact`
+(проверка исходящих запросов на утечку секретов: предупреждение, блокировка или
+маскирование перед отправкой), `--disable-rule <id,id>`, `--config <файл>` (по
+умолчанию `~/.holone/config.json`, включая `severity_overrides`), `--log <файл|->`
+(jsonl-лог с ротацией 10 MiB × 3 бэкапа и правами `0600`, по умолчанию
+`~/.holone/holone.log`), `--log-alerts-only`, `--rules <файл>` / `--blocklist <файл>`,
+`--max-request-size` / `--max-response-size` (байты или `KiB`/`MiB`/`GiB`;
 по умолчанию 32 MiB на запрос и 64 MiB на ответ).
 
 стрим инспектируется **rolling-окнами** 256 KiB с перекрытием 8 KiB по всему
-ответу, а не только в первых мегабайтах — слепой зоны после 1 MiB больше нет.
-в block-режиме буферизация tool-call ограничена 8 MiB: превышение — fail-closed,
-вызов заменяется безопасной заметкой и high-finding `proto-toolcall-oversized`.
+ответу, а также с декодированием JSON-escape последовательностей в аргументах
+вызовов инструментов. в block-режиме буферизация tool-call ограничена 8 MiB:
+превышение — fail-closed, вызов заменяется безопасной заметкой и high-finding
+`proto-toolcall-oversized`.
 
 SSE-парсер ограничен: одна строка — 1 MiB, целый кадр — 4 MiB. в monitor байты
 по-прежнему форвардятся, но превышение даёт high `proto-sse-line-oversized` /
@@ -194,10 +200,11 @@ SSE-парсер ограничен: одна строка — 1 MiB, целый
 декодировано.
 
 превышение лимита тела не усекается молча: request → `413`, response → `502`.
-OpenAI Responses API (`/v1/responses`) парсится нативно; вредоносный
-`function_call` в block-режиме рвёт стрим fail-closed (`event: error`).
-неизвестные stream-протоколы в block-режиме не выдают за защищённые: поток
-фактически идёт monitor-only, а решение помечается `protection: unsupported`.
+нативно поддерживаются Anthropic Messages, OpenAI Chat Completions, OpenAI
+Responses API (`/v1/responses`, включая `*.done` и `mcp_call`/`shell_call`) и
+Google Gemini SSE. неизвестные stream-протоколы в block-режиме не выдают за
+защищённые: поток фактически идёт monitor-only, а решение помечается
+`protection: unsupported`.
 
 в jsonl-логе у каждого решения есть поле `protection`:
 `protected` | `monitor-only` | `unsupported`.
@@ -213,8 +220,12 @@ holone dashboard
 
 - хранит профили провайдеров в `~/.holone/providers.json`;
 - запускает и останавливает локальный proxy на `127.0.0.1:8787`;
-- переключает активный профиль без ручного перезапуска proxy;
-- показывает live-активность: clean / alert / blocked / scan / audit;
+- переключает активный профиль без ручного перезапуска proxy и роутит запросы по
+  `/p/<provider-id>/...` прямо на нужного провайдера;
+- показывает live-активность через SSE (`/api/events`): clean / alert / blocked /
+  dlp / scan / audit;
+- поддерживает `--egress-dlp`, `--disable-rule`, `--log-alerts-only`, `--config`,
+  `--rules` и `--blocklist`;
 - отдаёт каталог правил через `/api/rules`: `id`, категория, severity, pattern,
   описание на английском и русском;
 - запускает `scan` и `audit` из UI; в форме скана можно выбрать `protocol`
@@ -227,12 +238,15 @@ holone dashboard
 безопасность дашборда:
 
 - по умолчанию слушает только `127.0.0.1:9090`;
-- backend отклоняет не-loopback запросы;
+- backend отклоняет не-loopback запросы, включает `X-Frame-Options: DENY` и `CSP`,
+  проверяет `Origin`/`Sec-Fetch-Site` и JSON `Content-Type` от CSRF;
+- `/api/scan` по умолчанию блокирует localhost/приватные адреса против SSRF (для
+  локального теста укажи `--allow-private-scan`);
 - управляемый proxy можно bind-ить только на localhost/loopback;
 - API-ключи можно передать для разового scan, но профили их не сохраняют и API
-  никогда не возвращает секреты;
+  никогда не возвращает секреты; тела запросов маскируются в логах через `Redact`;
 - при необходимости включи токен: `HOLONE_DASHBOARD_TOKEN=... holone dashboard`
-  или `holone dashboard --token ...`.
+  или `holone dashboard --token ...` (UI поддерживает `?token=` и ввод токена).
 
 обычный запуск `holone proxy ...` остаётся полностью поддержанным для headless / cli
 сценариев.
@@ -243,14 +257,16 @@ holone dashboard
 holone scan https://api-cc.freemodel.dev --key $ANTHROPIC_API_KEY
 ```
 
-шлёт промпт, которому **не** нужны инструменты, и палит любой `tool_use` в ответе;
-прогоняет правила по выводу; сверяет домен/ip с блоклистом; смотрит tls-сертификат;
-печатает risk-score и вердикт. чистый результат **не** доказывает безопасность —
-см. честную оговорку выше.
+шлёт набор canary-проб (включая SSE `stream-no-tool` и `with-tools` для
+проверки незадекларированных имён инструментов), прогоняет правила по выводу,
+сверяет домен/ip с блоклистом (включая пользовательский `--blocklist`),
+смотрит tls-сертификат, печатает risk-score и вердикт. при `400` на
+discovery-пробах умеет подтягивать модель из `/v1/models`. чистый результат
+**не** доказывает безопасность — см. честную оговорку выше.
 
 флаги: `--protocol auto|chat-completions|responses|anthropic` (по умолчанию
 `auto`), `--path <путь>` — явный endpoint вместо вычисленного, `--model <id>` —
-модель для проб.
+модель для проб, `--rules <файл>`, `--blocklist <файл>`, `--json`.
 
 base url нормализуется: `https://host`, `…/v1`, `…/api`, `…/api/v1` (с хвостовым
 слэшем или без) дают корректный путь — `/v1/v1` не появляется. в `auto` режиме
@@ -260,18 +276,21 @@ responses, anthropic), включая OpenAI Responses API.
 ### `holone audit` — разовая проверка машины
 
 ```sh
-holone audit
+holone audit [--rules <файл>] [--blocklist <файл>] [--json]
 ```
 
 ищет индикаторы кампании: левые процессы (`awproxy.exe`, `tun2socks`…), задачи
-персистентности (`CodeAssist`, `StartupOptimizer`), дроп-пути
-(`%LOCALAPPDATA%\Microsoft\SngCache`), соединения с публичным socks-эндпоинтом
-или known-bad ip, подозрительные proxy-переменные.
+персистентности (Windows Scheduled Tasks, Registry `Run`, исключения Defender;
+macOS/Linux `LaunchAgents`, user `systemd`, `crontab`), дроп-пути, соединения с
+публичным socks-эндпоинтом или known-bad ip, подозрительные proxy-переменные, а
+также заражённые конфиги AI-клиентов (`.claude/`, `.cursor/`, `.mcp.json`,
+`CLAUDE.md`/`AGENTS.md`/`.cursorrules`, `.npmrc`, `pip.conf`, shell RC,
+`.git/config` `core.hooksPath` и хуки `.git/hooks/*`).
 
 ### `holone sentinel` — фоновый мониторинг
 
 ```sh
-holone sentinel --interval 30s
+holone sentinel --interval 30s [--rules <файл>] [--blocklist <файл>]
 ```
 
 перепрогоняет аудит по интервалу и алертит, как только появляется новый индикатор.
@@ -282,17 +301,21 @@ holone sentinel --interval 30s
 
 - **поведенческие правила** (`rules/rules.json`): re2-регэкспы по категориям
   (download-exec, obfuscation, persistence, network, anti-forensics, locale,
-  client-config, credential-theft, exfil, git-attack). гоняются по собранному
-  вводу инструмента / аргументам вызова / тексту ответа.
+  client-config, credential-theft, exfil, git-attack, egress-dlp). гоняются по
+  собранному вводу инструмента / декодированным аргументам вызова / тексту ответа.
 - **ioc-блоклист** (`rules/blocklist.json`): известные плохие домены, ip, пути,
   имена задач и процессов.
 - **аномалия протокола**: вызов инструмента без объявленных клиентом инструментов
   = инъекция (`proto-tooluse-unsolicited`). если инструменты объявлены, но
   провайдер вернул имя, которого не было в запросе, — high
   `proto-tool-name-not-declared` (в block-режиме блокируется).
-- **redaction**: `Finding.Match` / `Excerpt` маскируются перед записью в лог и
-  дашборд (telegram / discord / slack webhooks, `Bearer`, `sk-…`, `xox…`,
-  `ghp_…`, `AKIA…`). детект при этом по-прежнему идёт по сырому тексту.
+- **egress DLP (`--egress-dlp`)**: 12 детекторов секретов в исходящих запросах
+  (приватные ключи, cloud/AI токены, webhooks, Basic Auth) в режимах
+  `off|warn|block|redact`.
+- **redaction**: `Finding.Match`, `Excerpt` и лог тела запроса маскируются перед
+  записью в лог и дашборд (PEM-ключи, webhooks, `Bearer`, `sk-…`, `xox…`, `ghp_…`,
+  `github_pat_…`, `AIza…`, `AKIA…`, `ASIA…`, URL Basic Auth и секретные
+  query-параметры). детект при этом идёт по сырому тексту.
 
 оба файла встроены в бинарь (`go:embed`), так что он самодостаточен, и оба можно
 переопределить в рантайме. **новые правила и ioc приветствуются** — см.
@@ -302,13 +325,16 @@ holone sentinel --interval 30s
 
 ## известные нюансы
 
-- **пассивный слив не детектится** (повторюсь, это важно) — структурное решение
-  одно: не гонять секреты через недоверенных провайдеров.
+- **пассивный сбор контекста не детектится на уровне ответа** — режим
+  `--egress-dlp warn|block|redact` помогает остановить *случайную* отправку
+  ключей и токенов в исходящем запросе, но если данные уже ушли недоверенному
+  провайдеру, факт их чтения на его стороне не виден. структурное решение одно:
+  не гонять секреты через недоверенных провайдеров.
 - **block-режим может резать легитимный security-контент.** если ты работаешь
   *над* кодом, где законно встречаются `curl|sh`, `certutil`, `schtasks` (например,
   пишешь сам детектор), block-режим вырежет такие `tool_use`. для такой работы
-  используй `monitor`. _(да, holone однажды заблокировал собственный коммит —
-  лучший догфудинг.)_
+  используй `monitor` (или точечно `--disable-rule <id>`). _(да, holone однажды
+  заблокировал собственный коммит — лучший догфудинг.)_
 - отличить шум от атаки просто: в логе смотри `source` (`text` = модель просто
   пишет про опасное; `tool_use:…` = реальный вызов) и флаг `proto-tooluse-unsolicited`.
 
@@ -321,9 +347,10 @@ holone sentinel --interval 30s
   `--max-request-size 64MiB --max-response-size 128MiB`).
 - **`protection: unsupported`.** в `block`-режиме поток неизвестного протокола
   нельзя безопасно переписать, поэтому он идёт monitor-only. убедись, что клиент
-  ходит на `/v1/messages` (anthropic), `/v1/chat/completions` (openai chat) или
-  `/v1/responses` (responses); нестандартный путь разбирай через
-  `holone scan --protocol … --path …`.
+  ходит на `/v1/messages` (anthropic), `/v1/chat/completions` (openai chat),
+  `/v1/responses` (responses) или Google Gemini `:streamGenerateContent` (при
+  необходимости задай `--protocol`); для нескольких провайдеров используй
+  `/p/<provider-id>/...` через dashboard.
 - **`bind: address already in use`.** порт уже занят другим holone/прокси.
   закрой старый процесс или возьми другой порт: `--listen 127.0.0.1:8788`
   (для дашборда — `holone dashboard --listen 127.0.0.1:9091`).
@@ -343,11 +370,11 @@ holone sentinel --interval 30s
 
 ```
 cmd/holone            cli (proxy | scan | audit | sentinel | dashboard)
-internal/dashboard    локальный backend/API центра управления
-internal/proxy        инспектирующий реверс-прокси (anthropic + openai chat/responses sse)
-internal/inspect      движок детекта (регэкспы + ioc)
+internal/dashboard    локальный backend/API центра управления (SSE, CSRF/SSRF защита)
+internal/proxy        инспектирующий реверс-прокси (anthropic + openai chat/responses + gemini sse, router, dlp)
+internal/inspect      движок детекта (регэкспы + ioc + json-unescape + egress dlp + policy)
 internal/scanner      canary-сканер эндпоинта
-internal/sentinel     ос-проверки ioc (windows + posix)
+internal/sentinel     ос-проверки ioc и конфигов ai-клиентов (windows + posix)
 internal/mockevil     тестовая заглушка: фейковый вредоносный провайдер
 rules/                встроенные rules.json + blocklist.json
 ```

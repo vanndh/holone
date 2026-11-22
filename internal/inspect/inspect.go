@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/vanndh/holone/rules"
 )
@@ -141,10 +142,13 @@ type Finding struct {
 
 // Engine is a compiled, immutable, concurrency-safe detector.
 type Engine struct {
-	rules       []compiledRule
-	terms       []blockTerm
-	descByID    map[string]string
-	hasKeywords bool // at least one rule has a keyword prefilter
+	rules         []compiledRule
+	terms         []blockTerm
+	blocklist     Blocklist
+	descByID      map[string]string
+	hasKeywords   bool // at least one rule has a keyword prefilter
+	disabledRules map[string]bool
+	sevOverrides  map[string]Severity
 }
 
 // New compiles an engine from raw rules.json and blocklist.json bytes.
@@ -175,6 +179,7 @@ func New(rulesJSON, blocklistJSON []byte) (*Engine, error) {
 		if err := json.Unmarshal(blocklistJSON, &bl); err != nil {
 			return nil, fmt.Errorf("parse blocklist: %w", err)
 		}
+		e.blocklist = bl
 		addTerms := func(kind string, vals []string) {
 			for _, v := range vals {
 				v = strings.TrimSpace(v)
@@ -192,6 +197,21 @@ func New(rulesJSON, blocklistJSON []byte) (*Engine, error) {
 		addTerms("hash", bl.Hashes)
 	}
 	return e, nil
+}
+
+// Blocklist returns a copy of the engine's compiled IOC blocklist.
+func (e *Engine) Blocklist() Blocklist {
+	if e == nil {
+		return Blocklist{}
+	}
+	return Blocklist{
+		Domains:      append([]string(nil), e.blocklist.Domains...),
+		IPs:          append([]string(nil), e.blocklist.IPs...),
+		Paths:        append([]string(nil), e.blocklist.Paths...),
+		TaskNames:    append([]string(nil), e.blocklist.TaskNames...),
+		ProcessNames: append([]string(nil), e.blocklist.ProcessNames...),
+		Hashes:       append([]string(nil), e.blocklist.Hashes...),
+	}
 }
 
 // Default builds an engine from the embedded default rule set.
@@ -310,15 +330,20 @@ func (e *Engine) Inspect(text, source string) []Finding {
 			if idx < 0 {
 				continue
 			}
-			add(Finding{
+			f := Finding{
 				RuleID:      "ioc-" + bt.kind,
 				Category:    "ioc",
 				Severity:    SevHigh.String(),
 				Match:       bt.term,
-				Excerpt:     redact(excerpt(text, idx, idx+len(bt.lower))),
+				// idx is an offset in low (strings.ToLower(text)), which can differ
+				// in byte length from text on Unicode case-folding (e.g. 'İ').
+				Excerpt:     redact(excerpt(low, idx, idx+len(bt.lower))),
 				Source:      source,
 				Description: "Known indicator of compromise (" + bt.kind + ")",
-			})
+			}
+			if pf, ok := e.ApplyPolicy(f); ok {
+				add(pf)
+			}
 		}
 	}
 	return out
@@ -484,13 +509,32 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	if n <= 0 {
+		return "…"
+	}
+	cut := n
+	for cut > 0 && cut > n-utf8.UTFMax && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // excerpt returns a whitespace-collapsed, length-bounded window of context
 // around [start,end) so logs are readable and don't leak huge blobs.
 func excerpt(text string, start, end int) string {
 	const pad = 48
+	if start < 0 {
+		start = 0
+	}
+	if start > len(text) {
+		start = len(text)
+	}
+	if end < start {
+		end = start
+	}
+	if end > len(text) {
+		end = len(text)
+	}
 	lo := start - pad
 	if lo < 0 {
 		lo = 0
@@ -498,6 +542,12 @@ func excerpt(text string, start, end int) string {
 	hi := end + pad
 	if hi > len(text) {
 		hi = len(text)
+	}
+	for lo < hi && lo < len(text) && !utf8.RuneStart(text[lo]) {
+		lo++
+	}
+	for hi > lo && hi < len(text) && !utf8.RuneStart(text[hi]) {
+		hi--
 	}
 	window := text[lo:hi]
 	window = strings.Join(strings.Fields(window), " ")

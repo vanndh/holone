@@ -2,6 +2,7 @@ package inspect
 
 import (
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -19,8 +20,16 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(\bsk-[A-Za-z0-9_-]{16,})`),
 	regexp.MustCompile(`(xox[baprs]-[A-Za-z0-9-]{10,})`),
 	regexp.MustCompile(`(\bgh[pousr]_[A-Za-z0-9]{20,})`),
-	regexp.MustCompile(`(\bAKIA[0-9A-Z]{16}\b)`),
+	regexp.MustCompile(`(\bgithub_pat_[A-Za-z0-9_]{20,})`),
+	regexp.MustCompile(`(\bAIza[0-9A-Za-z_-]{35}\b)`),
+	regexp.MustCompile(`(\b(?:AKIA|ASIA)[0-9A-Z]{16}\b)`),
+	regexp.MustCompile(`(?i)([?&](?:api_key|apikey|token|access_token|secret|key)=[^&\s"'` + "`" + `<>()[\]{},;]{8,})`),
 }
+
+var (
+	pemSecretPattern     = regexp.MustCompile(`(?s)(-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)([\s\S]+?)(-----END [A-Z0-9 ]*PRIVATE KEY-----)`)
+	urlCredSecretPattern = regexp.MustCompile(`(https?://[^/\s:@]+:)([^/\s@]+)(@)`)
+)
 
 // secretLeaks returns the credential patterns present in a finding field or in
 // redacted output. Matching the pattern (rather than searching for a previously
@@ -32,6 +41,16 @@ func secretLeaks(field string) []string {
 	var out []string
 	for _, re := range secretPatterns {
 		out = append(out, re.FindAllString(field, -1)...)
+	}
+	for _, m := range pemSecretPattern.FindAllStringSubmatch(field, -1) {
+		if strings.TrimSpace(m[2]) != "[REDACTED]" {
+			out = append(out, m[0])
+		}
+	}
+	for _, m := range urlCredSecretPattern.FindAllStringSubmatch(field, -1) {
+		if m[2] != "[REDACTED]" {
+			out = append(out, m[0])
+		}
 	}
 	return out
 }
@@ -103,7 +122,13 @@ func FuzzRedact(f *testing.F) {
 		`OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234567890`,
 		`token xoxb-123456789012-abcdefghijkl`,
 		`token ghp_abcdefghijklmnopqrstuvwxyz0123456789`,
+		`token github_pat_11ABCDEFG0123456789_abcdefghijklmnop`,
+		`GOOGLE_API_KEY=AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe`,
 		`AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE`,
+		`AWS_STS_KEY_ID=ASIAIOSFODNN7EXAMPLE`,
+		"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234567890abcdef\n-----END RSA PRIVATE KEY-----",
+		`https://deploy:s3cr3tp4ss@git.example.com/repo.git`,
+		`https://api.example.com/data?api_key=secretvalue1234&page=1`,
 		"almost: api.telegram.org/bot1:short /webhooks/1/short Bearer short",
 		// Regression seed: xox tokens are redacted even when glued to a
 		// preceding word character, so 0xoxa-... must become 0xoxa-[REDACTED].

@@ -4,13 +4,20 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/vanndh/holone/internal/scanner"
 )
+
+const maxDashboardBodyBytes = 1 << 20 // 1 MiB
 
 func New(cfg Config) *Server {
 	if cfg.Activity == nil {
@@ -19,7 +26,7 @@ func New(cfg Config) *Server {
 	if cfg.Providers == nil {
 		cfg.Providers = &ProviderStore{next: 1}
 	}
-	manager := NewProxyManager(cfg.Engine, cfg.ProxyLog, cfg.Activity)
+	manager := newProxyManagerFromConfig(cfg)
 	srv := &Server{
 		cfg:     cfg,
 		mux:     http.NewServeMux(),
@@ -39,6 +46,7 @@ func New(cfg Config) *Server {
 func (s *Server) routes() {
 	s.mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		status := s.manager.Status()
+		status.Version = s.cfg.Version
 		if status.ListenAddr == "" {
 			status.ListenAddr = defaultProxyListen
 			status.ClientBaseURL = "http://" + defaultProxyListen
@@ -64,6 +72,7 @@ func (s *Server) routes() {
 			writeError(w, "POST required", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxDashboardBodyBytes)
 		var payload struct {
 			Providers []Provider `json:"providers"`
 		}
@@ -91,6 +100,7 @@ func (s *Server) routes() {
 			writeError(w, "POST required", http.StatusMethodNotAllowed)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxDashboardBodyBytes)
 		var req ProxyRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -105,7 +115,9 @@ func (s *Server) routes() {
 			writeError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, s.manager.Status())
+		st := s.manager.Status()
+		st.Version = s.cfg.Version
+		writeJSON(w, st)
 	})
 
 	s.mux.HandleFunc("/api/proxy/stop", func(w http.ResponseWriter, r *http.Request) {
@@ -119,7 +131,9 @@ func (s *Server) routes() {
 			writeError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, s.manager.Status())
+		st := s.manager.Status()
+		st.Version = s.cfg.Version
+		writeJSON(w, st)
 	})
 
 	s.mux.HandleFunc("/api/activity", func(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +149,54 @@ func (s *Server) routes() {
 			}
 		}
 		writeJSON(w, s.cfg.Activity.Recent(limit))
+	})
+
+	s.mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, "GET required", http.StatusMethodNotAllowed)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(": connected\n\n"))
+		flusher.Flush()
+
+		ch, unsub := s.cfg.Activity.Subscribe()
+		defer unsub()
+
+		keepalive := time.NewTicker(20 * time.Second)
+		defer keepalive.Stop()
+
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case entry, ok := <-ch:
+				if !ok {
+					return
+				}
+				b, err := json.Marshal(entry)
+				if err != nil {
+					continue
+				}
+				if _, err := fmt.Fprintf(w, "event: activity\ndata: %s\n\n", b); err != nil {
+					return
+				}
+				flusher.Flush()
+			case <-keepalive.C:
+				if _, err := w.Write([]byte(": keepalive\n\n")); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
 	})
 
 	s.mux.HandleFunc("/api/rules", func(w http.ResponseWriter, r *http.Request) {
@@ -154,6 +216,7 @@ func (s *Server) routes() {
 			writeError(w, "scanner not configured", http.StatusNotImplemented)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxDashboardBodyBytes)
 		var req ScanRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -162,6 +225,12 @@ func (s *Server) routes() {
 		if strings.TrimSpace(req.BaseURL) == "" {
 			writeError(w, "base_url required", http.StatusBadRequest)
 			return
+		}
+		if !s.cfg.AllowPrivateScan {
+			if err := validatePublicScanURL(req.BaseURL); err != nil {
+				writeError(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
 		protocol, err := scanner.NormalizeProtocol(req.Protocol)
 		if err != nil {
@@ -211,6 +280,7 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, s.cfg.Providers.List())
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, maxDashboardBodyBytes)
 		var p Provider
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 			writeError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -239,6 +309,7 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 			writeError(w, "?id required", http.StatusBadRequest)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxDashboardBodyBytes)
 		var p Provider
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 			writeError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -275,10 +346,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (s *Server) localOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
+
 		if !isLocalRequest(r) {
 			writeError(w, "dashboard accepts localhost requests only", http.StatusForbidden)
+			return
+		}
+		if err := checkSameOriginRequest(r); err != nil {
+			writeError(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		if err := checkJSONContentType(r); err != nil {
+			writeError(w, err.Error(), http.StatusUnsupportedMediaType)
 			return
 		}
 		if s.cfg.Token != "" {
@@ -293,6 +375,65 @@ func (s *Server) localOnly(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func checkSameOriginRequest(r *http.Request) error {
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || !strings.EqualFold(u.Host, r.Host) {
+			return errors.New("cross-origin request rejected")
+		}
+	}
+	if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs != "" && sfs != "same-origin" && sfs != "none" {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead || strings.HasPrefix(r.URL.Path, "/api/") {
+			return errors.New("cross-site request rejected")
+		}
+	}
+	return nil
+}
+
+func checkJSONContentType(r *http.Request) error {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		return nil
+	}
+	ct := strings.TrimSpace(r.Header.Get("Content-Type"))
+	if ct == "" {
+		if r.URL.Path == "/api/proxy/stop" && r.ContentLength == 0 {
+			return nil
+		}
+		return errors.New("Content-Type: application/json required")
+	}
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		return errors.New("Content-Type must be application/json")
+	}
+	return nil
+}
+
+func validatePublicScanURL(raw string) error {
+	s := strings.TrimSpace(raw)
+	if !strings.Contains(s, "://") {
+		s = "https://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" {
+		return errors.New("invalid base_url")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("base_url scheme must be http or https")
+	}
+	host := strings.ToLower(strings.Trim(u.Hostname(), "[]"))
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") ||
+		strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") ||
+		host == "metadata.google.internal" {
+		return errors.New("scan target host is private/local (pass --allow-private-scan to override)")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return errors.New("scan target IP is private/loopback (pass --allow-private-scan to override)")
+		}
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

@@ -32,8 +32,8 @@ func TestScanHonestEndpoint(t *testing.T) {
 	if res.Verdict == "malicious" || res.Verdict == "high-risk" {
 		t.Errorf("honest endpoint flagged as %s (score %d)", res.Verdict, res.RiskScore)
 	}
-	if len(res.Probes) != 4 {
-		t.Errorf("expected 4 probes, got %d", len(res.Probes))
+	if len(res.Probes) != 6 {
+		t.Errorf("expected 6 probes, got %d", len(res.Probes))
 	}
 	if res.SummaryEN == "" || res.SummaryRU == "" {
 		t.Fatalf("scan should include bilingual summaries: %+v", res)
@@ -196,8 +196,8 @@ func TestScanBaseURLWithV1DoesNotDuplicate(t *testing.T) {
 			t.Errorf("path %q duplicates /v1", p)
 		}
 	}
-	if len(res.Probes) != 2 {
-		t.Errorf("explicit protocol should produce 2 probes, got %d", len(res.Probes))
+	if len(res.Probes) != 3 {
+		t.Errorf("explicit protocol should produce 3 probes, got %d", len(res.Probes))
 	}
 }
 
@@ -221,8 +221,8 @@ func TestScanPathOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(paths) != 2 {
-		t.Fatalf("expected 2 requests, got %d (%v)", len(paths), paths)
+	if len(paths) != 3 {
+		t.Fatalf("expected 3 requests, got %d (%v)", len(paths), paths)
 	}
 	for _, p := range paths {
 		if p != "/custom/endpoint" {
@@ -272,8 +272,8 @@ func TestScanProtocolSelection(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(res.Probes) != 4 {
-			t.Fatalf("expected 4 probes (chat x2, anthropic x2), got %d", len(res.Probes))
+		if len(res.Probes) != 6 {
+			t.Fatalf("expected 6 probes (chat x3, anthropic x3), got %d", len(res.Probes))
 		}
 		seen := map[string]bool{}
 		for _, p := range res.Probes {
@@ -299,8 +299,8 @@ func TestScanProtocolSelection(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(res.Probes) != 2 {
-			t.Fatalf("expected 2 probes, got %d", len(res.Probes))
+		if len(res.Probes) != 3 {
+			t.Fatalf("expected 3 probes, got %d", len(res.Probes))
 		}
 		for _, p := range res.Probes {
 			if p.Protocol != ProtocolResponses {
@@ -326,8 +326,8 @@ func TestScanProtocolSelection(t *testing.T) {
 		if len(res.Discovery) != 1 || res.Discovery[0].Protocol != ProtocolAnthropic {
 			t.Fatalf("unexpected discovery: %+v", res.Discovery)
 		}
-		if len(res.Probes) != 2 {
-			t.Fatalf("expected 2 probes, got %d", len(res.Probes))
+		if len(res.Probes) != 3 {
+			t.Fatalf("expected 3 probes, got %d", len(res.Probes))
 		}
 		for _, p := range res.Probes {
 			if p.Protocol != ProtocolAnthropic {
@@ -359,8 +359,8 @@ func TestScanProtocolSelection(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if len(bodies) != 2 {
-			t.Fatalf("expected 2 requests, got %d", len(bodies))
+		if len(bodies) != 3 {
+			t.Fatalf("expected 3 requests, got %d", len(bodies))
 		}
 		for _, b := range bodies {
 			if _, ok := b["input"]; !ok {

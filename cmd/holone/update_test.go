@@ -77,6 +77,31 @@ func TestUpdateCheckCanBeDisabled(t *testing.T) {
 	if !updateCheckDisabled([]string{"holone", "scan", "--no-update-check", "https://example.com"}) {
 		t.Fatal("command flag should disable update checks")
 	}
+	if !updateCheckDisabled([]string{"holone", "version"}) {
+		t.Fatal("version command should skip update checks")
+	}
+	if !updateCheckDisabled([]string{"holone", "audit", "--json"}) {
+		t.Fatal("--json output should skip update checks")
+	}
+}
+
+func TestUpdateCacheFailureBackoff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "update-check.json")
+	if err := writeFailedUpdateCache(path, time.Now().Add(-10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	_, fresh, recentlyFailed := readUpdateCacheState(path, 12*time.Hour, 2*time.Hour)
+	if fresh || !recentlyFailed {
+		t.Fatalf("expected recentlyFailed=true, fresh=false; got fresh=%v failed=%v", fresh, recentlyFailed)
+	}
+
+	if err := writeFailedUpdateCache(path, time.Now().Add(-3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	_, fresh, recentlyFailed = readUpdateCacheState(path, 12*time.Hour, 2*time.Hour)
+	if fresh || recentlyFailed {
+		t.Fatalf("expected expired backoff; got fresh=%v failed=%v", fresh, recentlyFailed)
+	}
 }
 
 func TestArgsWithoutUpdateFlag(t *testing.T) {

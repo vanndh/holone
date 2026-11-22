@@ -48,7 +48,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
   border-bottom: 1px solid var(--border);
 }
 .logo-title { font-size: 18px; font-weight: 700; color: var(--text-bright); letter-spacing: -0.3px; }
-.logo-sub { font-size: 11px; color: var(--dim); margin-top: 2px; font-family: var(--mono); }
+.logo-sub { font-size: 11px; color: var(--dim); margin-top: 2px; font-family: var(--mono); min-height: 16px; }
 .nav { padding: 8px 0; flex: 1; overflow-y: auto; }
 .nav-item {
   display: flex; align-items: center; gap: 10px;
@@ -90,9 +90,6 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 
 /* --- Main --- */
 .main { padding: 28px 36px; max-width: 1280px; overflow-y: auto; }
-.view { display: none; }
-.view.active { display: block; animation: fadeIn 200ms ease; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 h2 { font-size: 20px; font-weight: 600; color: var(--text-bright); margin-bottom: 20px; letter-spacing: -0.3px; }
 h3 { font-size: 14px; font-weight: 600; color: var(--dim); margin: 24px 0 12px; text-transform: uppercase; letter-spacing: 0.5px; }
 
@@ -112,14 +109,6 @@ h3 { font-size: 14px; font-weight: 600; color: var(--dim); margin: 24px 0 12px; 
 .card.ok .value { color: var(--green); }
 .card.alert .value { color: var(--red); }
 .card.warn .value { color: var(--yellow); }
-
-/* --- Status dot --- */
-.dot {
-  display: inline-block; width: 8px; height: 8px;
-  border-radius: 50%; margin-right: 6px; vertical-align: middle;
-}
-.dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
-.dot.off { background: var(--red); }
 
 /* --- Table --- */
 .table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
@@ -226,7 +215,6 @@ input::placeholder { color: var(--dim); }
 
 /* --- Empty state --- */
 .empty { color: var(--dim); text-align: center; padding: 48px 20px; font-size: 13px; }
-.empty-icon { font-size: 32px; margin-bottom: 8px; opacity: 0.3; }
 
 /* --- Modal --- */
 .modal-overlay {
@@ -287,13 +275,13 @@ input::placeholder { color: var(--dim); }
   <nav class="sidebar">
     <div class="logo">
       <div class="logo-title">holone</div>
-      <div class="logo-sub">v0.3.0</div>
+      <div class="logo-sub" id="logo-version"></div>
     </div>
     <div class="nav" id="nav"></div>
     <div class="sidebar-footer">
       <div class="lang-toggle">
-        <button class="lang-btn active" data-lang="ru" onclick="setLang('ru')">RU</button>
-        <button class="lang-btn" data-lang="en" onclick="setLang('en')">EN</button>
+        <button class="lang-btn active" data-lang="ru">RU</button>
+        <button class="lang-btn" data-lang="en">EN</button>
       </div>
       <span id="footer-text">Secure by design</span>
     </div>
@@ -302,6 +290,31 @@ input::placeholder { color: var(--dim); }
 </div>
 
 <script>
+// ============ Token bootstrap ============
+(function initTokenFromURL() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const tok = params.get('token');
+    if (tok) {
+      sessionStorage.setItem('holone_token', tok);
+      params.delete('token');
+      const qs = params.toString();
+      const clean = window.location.pathname + (qs ? '?' + qs : '') + window.location.hash;
+      window.history.replaceState(null, '', clean);
+    }
+  } catch (_) {}
+})();
+
+function getToken() {
+  try { return sessionStorage.getItem('holone_token') || ''; } catch (_) { return ''; }
+}
+function setToken(tok) {
+  try {
+    if (tok) sessionStorage.setItem('holone_token', tok);
+    else sessionStorage.removeItem('holone_token');
+  } catch (_) {}
+}
+
 // ============ i18n ============
 const I18N = {
   ru: {
@@ -343,6 +356,7 @@ const I18N = {
     clientBaseUrl: 'Client Base URL', selectProvider: 'Выберите провайдера', proxyStarted: 'Прокси запущен', proxyStopped: 'Прокси остановлен', copyToClient: 'пропиши это в AI-клиенте', copied: 'Скопировано',
     ruleId: 'ID правила', category: 'Категория', severity: 'Угроза', description: 'Описание', pattern: 'Паттерн',
     rulesCatalog: 'Каталог правил', high: 'high', medium: 'medium', low: 'low', search: 'Поиск', all: 'Все', edit: 'Изменить', providerUpdated: 'Провайдер обновлён', use: 'Использовать', explain: 'Разбор', close: 'Закрыть', importProfiles: 'Импорт', exportProfiles: 'Экспорт', request: 'Запрос', findingsTitle: 'Сработавшие правила', requestBody: 'Тело запроса', noFindings: 'Нет детальных находок',
+    routePath: 'Маршрут прокси', tokenPrompt: 'Введите токен дашборда (X-Holone-Token):',
   },
   en: {
     overview: 'Overview', providers: 'Providers', activity: 'Activity',
@@ -382,6 +396,7 @@ const I18N = {
     clientBaseUrl: 'Client Base URL', selectProvider: 'Select provider', proxyStarted: 'Proxy started', proxyStopped: 'Proxy stopped', copyToClient: 'use this in your AI client', copied: 'Copied',
     ruleId: 'Rule ID', category: 'Category', severity: 'Severity', description: 'Description', pattern: 'Pattern',
     rulesCatalog: 'Rules Catalog', high: 'high', medium: 'medium', low: 'low', search: 'Search', all: 'All', edit: 'Edit', providerUpdated: 'Provider updated', use: 'Use', explain: 'Explain', close: 'Close', importProfiles: 'Import', exportProfiles: 'Export', request: 'Request', findingsTitle: 'Triggered rules', requestBody: 'Request body', noFindings: 'No detailed findings',
+    routePath: 'Proxy route', tokenPrompt: 'Enter dashboard token (X-Holone-Token):',
   }
 };
 let lang = 'ru';
@@ -401,10 +416,30 @@ let scanResult = null;
 let auditResult = null;
 let statusCache = null;
 let rulesCache = null;
+let activityItems = [];
+let filteredRuleItems = [];
+let eventSource = null;
 
 // ============ API ============
-async function api(path, opts) {
-  const r = await fetch(path, opts);
+async function api(path, opts, retried) {
+  const init = Object.assign({}, opts || {});
+  const headers = Object.assign({}, init.headers || {});
+  const tok = getToken();
+  if (tok) headers['X-Holone-Token'] = tok;
+  const method = (init.method || 'GET').toUpperCase();
+  if ((method === 'POST' || method === 'PUT') && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
+  }
+  init.headers = headers;
+  const r = await fetch(path, init);
+  if (r.status === 401 && !retried) {
+    const entered = window.prompt(t('tokenPrompt'));
+    if (entered && entered.trim()) {
+      setToken(entered.trim());
+      connectActivityStream();
+      return api(path, opts, true);
+    }
+  }
   if (!r.ok) {
     const e = await r.json().catch(() => ({error: r.statusText}));
     throw new Error(e.error || 'Request failed');
@@ -419,8 +454,57 @@ function toast(msg, type) {
   setTimeout(() => el.remove(), 3500);
 }
 function esc(s) {
-  if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function safeSeverity(s) {
+  const v = String(s || '').toLowerCase();
+  return (v === 'high' || v === 'medium' || v === 'low') ? v : 'low';
+}
+function safeVerdictClass(v) {
+  switch (v) {
+    case 'malicious':
+    case 'high-risk':
+    case 'suspicious':
+    case 'no-active-injection-detected':
+    case 'could-not-probe':
+      return v;
+    default:
+      return '';
+  }
+}
+function updateVersionLabel(status) {
+  const el = document.getElementById('logo-version');
+  if (el && status && status.version) {
+    el.textContent = 'v' + String(status.version).replace(/^v/, '');
+  }
+}
+
+// ============ Live SSE ============
+function connectActivityStream() {
+  if (typeof EventSource === 'undefined') return;
+  if (eventSource) {
+    eventSource.close();
+    eventSource = null;
+  }
+  const tok = getToken();
+  const url = '/api/events' + (tok ? '?token=' + encodeURIComponent(tok) : '');
+  eventSource = new EventSource(url);
+  eventSource.addEventListener('activity', (ev) => {
+    try {
+      const entry = JSON.parse(ev.data);
+      activityItems.unshift(entry);
+      if (activityItems.length > 200) activityItems.length = 200;
+      if (currentView === 'overview') {
+        const feedEl = document.getElementById('recent-activity');
+        if (feedEl) renderFeed(feedEl, activityItems.slice(0, 10), t('noEvents'));
+        refreshStatusCardsOnly();
+      } else if (currentView === 'activity') {
+        const feedEl = document.getElementById('activity-feed');
+        if (feedEl) renderFeed(feedEl, activityItems, t('noEvents'), document.getElementById('activity-empty'));
+      }
+    } catch (_) {}
+  });
 }
 
 // ============ Navigation ============
@@ -436,11 +520,15 @@ const NAV_ITEMS = [
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = NAV_ITEMS.map(item =>
-    `<div class="nav-item ${item.id===currentView?'active':''}" data-view="${item.id}" onclick="switchView('${item.id}')">
+    `<div class="nav-item ${item.id===currentView?'active':''}" data-view="${item.id}">
       <span class="nav-icon">${item.icon}</span>
-      <span>${t(item.id)}</span>
+      <span>${esc(t(item.id))}</span>
     </div>`
   ).join('');
+  nav.onclick = (ev) => {
+    const item = ev.target.closest('[data-view]');
+    if (item) switchView(item.dataset.view);
+  };
   document.getElementById('footer-text').textContent = t('secureByDesign');
 }
 
@@ -461,54 +549,85 @@ function renderCurrentView() {
 }
 
 // ============ Overview ============
+function buildStatusCardsHTML(status) {
+  const running = Boolean(status.proxy_running);
+  return `
+    <div class="card ${running?'ok':'alert'}">
+      <div class="label">${esc(t('proxy'))}</div>
+      <div class="value">${running?'ON':'OFF'}</div>
+      <div class="sub">${running ? esc(status.upstream) : esc(t('stopped'))}</div>
+    </div>
+    <div class="card"><div class="label">${esc(t('mode'))}</div><div class="value" style="font-size:16px">${esc(status.mode||'—')}</div><div class="sub">${esc(status.listen_addr||'')}</div></div>
+    <div class="card"><div class="label">${esc(t('clientBaseUrl'))}</div><div class="value" style="font-size:16px">${esc(status.client_base_url||'http://127.0.0.1:8787')}</div><div class="sub">${esc(t('copyToClient'))}</div></div>
+    <div class="card"><div class="label">${esc(t('activeProvider'))}</div><div class="value" style="font-size:16px">${esc(status.provider_name||'—')}</div><div class="sub">${esc(status.upstream||'')}</div></div>
+    <div class="card"><div class="label">${esc(t('rules'))}</div><div class="value">${Number(status.rules_count)||0}</div></div>
+    <div class="card alert"><div class="label">${esc(t('alerts'))}</div><div class="value">${Number(status.alerts_total)||0}</div></div>
+    <div class="card alert"><div class="label">${esc(t('blocks'))}</div><div class="value">${Number(status.blocks_total)||0}</div></div>
+  `;
+}
+
+async function refreshStatusCardsOnly() {
+  try {
+    const status = await api('/api/status');
+    statusCache = status;
+    updateVersionLabel(status);
+    const cards = document.getElementById('status-cards');
+    if (cards && currentView === 'overview') {
+      cards.innerHTML = buildStatusCardsHTML(status);
+    }
+  } catch (_) {}
+}
+
 async function renderOverview(main) {
-  main.innerHTML = `<h2>${t('overview')}</h2><div class="cards" id="status-cards"></div><div id="proxy-controls" style="margin-bottom:28px"></div><h3>${t('recentEvents')}</h3><div class="feed" id="recent-activity"></div>`;
+  main.innerHTML = `<h2>${esc(t('overview'))}</h2><div class="cards" id="status-cards"></div><div id="proxy-controls" style="margin-bottom:28px"></div><h3>${esc(t('recentEvents'))}</h3><div class="feed" id="recent-activity"></div>`;
   try {
     const [status, activity, providers] = await Promise.all([api('/api/status'), api('/api/activity'), api('/api/providers')]);
     statusCache = status;
-    const running = status.proxy_running;
-    const cards = document.getElementById('status-cards');
-    cards.innerHTML = `
-      <div class="card ${running?'ok':'alert'}">
-        <div class="label">${t('proxy')}</div>
-        <div class="value">${running?'ON':'OFF'}</div>
-        <div class="sub">${running ? status.upstream : t('stopped')}</div>
-      </div>
-      <div class="card"><div class="label">${t('mode')}</div><div class="value" style="font-size:16px">${esc(status.mode||'—')}</div><div class="sub">${esc(status.listen_addr||'')}</div></div>
-      <div class="card"><div class="label">${t('clientBaseUrl')}</div><div class="value" style="font-size:16px">${esc(status.client_base_url||'http://127.0.0.1:8787')}</div><div class="sub">${t('copyToClient')}</div></div>
-      <div class="card"><div class="label">${t('activeProvider')}</div><div class="value" style="font-size:16px">${esc(status.provider_name||'—')}</div><div class="sub">${esc(status.upstream||'')}</div></div>
-      <div class="card"><div class="label">${t('rules')}</div><div class="value">${status.rules_count||0}</div></div>
-      <div class="card alert"><div class="label">${t('alerts')}</div><div class="value">${status.alerts_total||0}</div></div>
-      <div class="card alert"><div class="label">${t('blocks')}</div><div class="value">${status.blocks_total||0}</div></div>
-    `;
+    activityItems = Array.isArray(activity) ? activity : [];
+    updateVersionLabel(status);
+    document.getElementById('status-cards').innerHTML = buildStatusCardsHTML(status);
     document.getElementById('proxy-controls').innerHTML = renderProxyControls(status, providers);
-    renderFeed(document.getElementById('recent-activity'), activity.slice(0, 10), t('noEvents'));
+    renderFeed(document.getElementById('recent-activity'), activityItems.slice(0, 10), t('noEvents'));
   } catch(e) { toast(e.message, 'error'); }
 }
 
 // ============ Providers ============
 async function renderProviders(main) {
   main.innerHTML = `
-    <div class="toolbar"><h2>${t('providers')}</h2><div style="display:flex;gap:8px"><button class="btn secondary" onclick="exportProfiles()">${t('exportProfiles')}</button><button class="btn secondary" onclick="importProfiles()">${t('importProfiles')}</button><button class="btn" onclick="showAddProvider()">+ ${t('addProvider')}</button></div></div>
+    <div class="toolbar"><h2>${esc(t('providers'))}</h2><div style="display:flex;gap:8px"><button class="btn secondary" id="btn-export-profiles">${esc(t('exportProfiles'))}</button><button class="btn secondary" id="btn-import-profiles">${esc(t('importProfiles'))}</button><button class="btn" id="btn-add-provider">+ ${esc(t('addProvider'))}</button></div></div>
     <div class="table-wrap" id="providers-table"></div>
-    <div class="empty" id="providers-empty" style="display:none">${t('noProviders')}</div>`;
+    <div class="empty" id="providers-empty" style="display:none">${esc(t('noProviders'))}</div>`;
+  document.getElementById('btn-export-profiles').onclick = exportProfiles;
+  document.getElementById('btn-import-profiles').onclick = importProfiles;
+  document.getElementById('btn-add-provider').onclick = showAddProvider;
   try {
     const list = await api('/api/providers');
     const el = document.getElementById('providers-table');
     const empty = document.getElementById('providers-empty');
     if (list.length === 0) { el.innerHTML = ''; empty.style.display = 'block'; return; }
     empty.style.display = 'none';
+    const baseClient = (statusCache && statusCache.client_base_url) || 'http://127.0.0.1:8787';
     el.innerHTML = `<table>
-      <thead><tr><th>ID</th><th>${t('name')}</th><th>${t('baseUrl')}</th><th>${t('model')}</th><th>${t('tags')}</th><th>${t('added')}</th><th></th></tr></thead>
+      <thead><tr><th>ID</th><th>${esc(t('name'))}</th><th>${esc(t('baseUrl'))}</th><th>${esc(t('routePath'))}</th><th>${esc(t('model'))}</th><th>${esc(t('tags'))}</th><th>${esc(t('added'))}</th><th></th></tr></thead>
       <tbody>${list.map(p => `<tr>
-        <td>${p.id}</td>
+        <td>${esc(p.id)}</td>
         <td>${esc(p.name)}</td>
         <td class="td-mono">${esc(p.base_url)}</td>
+        <td class="td-mono" style="color:var(--dim)">${esc(baseClient)}/p/${esc(p.id)}</td>
         <td class="td-mono">${esc(p.model||'—')}</td>
         <td>${(p.tags||[]).map(tg=>`<span class="badge dim">${esc(tg)}</span>`).join(' ')}</td>
         <td style="color:var(--dim);font-size:12px">${esc((p.added||'').slice(0,10))}</td>
-        <td style="display:flex;gap:6px"><button class="btn small" onclick="startProxy('${p.id}')">${t('use')}</button><button class="btn secondary small" onclick="editProvider('${p.id}')">${t('edit')}</button><button class="btn danger small" onclick="delProvider('${p.id}')">${t('delete')}</button></td>
+        <td style="display:flex;gap:6px"><button class="btn small" data-action="use" data-id="${esc(p.id)}">${esc(t('use'))}</button><button class="btn secondary small" data-action="edit" data-id="${esc(p.id)}">${esc(t('edit'))}</button><button class="btn danger small" data-action="delete" data-id="${esc(p.id)}">${esc(t('delete'))}</button></td>
       </tr>`).join('')}</tbody></table>`;
+    el.onclick = (ev) => {
+      const btn = ev.target.closest('button[data-action]');
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const act = btn.dataset.action;
+      if (act === 'use') startProxy(id);
+      else if (act === 'edit') editProvider(id);
+      else if (act === 'delete') delProvider(id);
+    };
   } catch(e) { toast(e.message, 'error'); }
 }
 
@@ -517,19 +636,20 @@ function showAddProvider() {
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `
     <div class="modal">
-      <h3>${t('newProvider')}</h3>
-      <div class="field"><label>${t('name')}</label><input id="p-name" placeholder="My Provider"></div>
-      <div class="field"><label>${t('baseUrl')}</label><input id="p-url" placeholder="https://api.example.com"></div>
+      <h3>${esc(t('newProvider'))}</h3>
+      <div class="field"><label>${esc(t('name'))}</label><input id="p-name" placeholder="My Provider"></div>
+      <div class="field"><label>${esc(t('baseUrl'))}</label><input id="p-url" placeholder="https://api.example.com"></div>
       <div class="form-row">
-        <div class="field"><label>${t('model')}</label><input id="p-model" placeholder="claude-3-5-sonnet"></div>
-        <div class="field"><label>${t('tags')}</label><input id="p-tags" placeholder="anthropic, openai"></div>
+        <div class="field"><label>${esc(t('model'))}</label><input id="p-model" placeholder="claude-sonnet-4-20250514"></div>
+        <div class="field"><label>${esc(t('tags'))}</label><input id="p-tags" placeholder="anthropic, openai"></div>
       </div>
       <div class="modal-actions">
-        <button class="btn secondary" onclick="this.closest('.modal-overlay').remove()">${t('cancel')}</button>
-        <button class="btn" id="p-save">${t('save')}</button>
+        <button class="btn secondary" data-close="1">${esc(t('cancel'))}</button>
+        <button class="btn" id="p-save">${esc(t('save'))}</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
+  overlay.querySelector('[data-close]').onclick = () => overlay.remove();
   overlay.querySelector('#p-save').addEventListener('click', async () => {
     const name = overlay.querySelector('#p-name').value.trim();
     const url = overlay.querySelector('#p-url').value.trim();
@@ -537,8 +657,7 @@ function showAddProvider() {
     const tags = overlay.querySelector('#p-tags').value.split(',').map(s=>s.trim()).filter(Boolean);
     if (!name || !url) { toast(t('enterUrl'), 'error'); return; }
     try {
-      await api('/api/providers', {method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({name, base_url:url, model, tags})});
+      await api('/api/providers', {method:'POST', body: JSON.stringify({name, base_url:url, model, tags})});
       overlay.remove(); renderCurrentView(); toast(t('providerAdded'), 'success');
     } catch(e) { toast(e.message, 'error'); }
   });
@@ -553,27 +672,27 @@ async function editProvider(id) {
     overlay.className = 'modal-overlay';
     overlay.innerHTML = `
       <div class="modal">
-        <h3>${t('edit')} — ${esc(p.name)}</h3>
-        <div class="field"><label>${t('name')}</label><input id="p-name" value="${esc(p.name)}"></div>
-        <div class="field"><label>${t('baseUrl')}</label><input id="p-url" value="${esc(p.base_url)}"></div>
+        <h3>${esc(t('edit'))} — ${esc(p.name)}</h3>
+        <div class="field"><label>${esc(t('name'))}</label><input id="p-name" value="${esc(p.name)}"></div>
+        <div class="field"><label>${esc(t('baseUrl'))}</label><input id="p-url" value="${esc(p.base_url)}"></div>
         <div class="form-row">
-          <div class="field"><label>${t('model')}</label><input id="p-model" value="${esc(p.model||'')}"></div>
-          <div class="field"><label>${t('tags')}</label><input id="p-tags" value="${esc((p.tags||[]).join(', '))}"></div>
+          <div class="field"><label>${esc(t('model'))}</label><input id="p-model" value="${esc(p.model||'')}"></div>
+          <div class="field"><label>${esc(t('tags'))}</label><input id="p-tags" value="${esc((p.tags||[]).join(', '))}"></div>
         </div>
         <div class="modal-actions">
-          <button class="btn secondary" onclick="this.closest('.modal-overlay').remove()">${t('cancel')}</button>
-          <button class="btn" id="p-save">${t('save')}</button>
+          <button class="btn secondary" data-close="1">${esc(t('cancel'))}</button>
+          <button class="btn" id="p-save">${esc(t('save'))}</button>
         </div>
       </div>`;
     document.body.appendChild(overlay);
+    overlay.querySelector('[data-close]').onclick = () => overlay.remove();
     overlay.querySelector('#p-save').addEventListener('click', async () => {
       const name = overlay.querySelector('#p-name').value.trim();
       const url = overlay.querySelector('#p-url').value.trim();
       const model = overlay.querySelector('#p-model').value.trim();
       const tags = overlay.querySelector('#p-tags').value.split(',').map(s=>s.trim()).filter(Boolean);
       try {
-        await api('/api/providers?id='+encodeURIComponent(id), {method:'PUT', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({name, base_url:url, model, tags})});
+        await api('/api/providers?id='+encodeURIComponent(id), {method:'PUT', body: JSON.stringify({name, base_url:url, model, tags})});
         overlay.remove(); renderCurrentView(); toast(t('providerUpdated'), 'success');
       } catch(e) { toast(e.message, 'error'); }
     });
@@ -582,20 +701,22 @@ async function editProvider(id) {
 
 async function delProvider(id) {
   if (!confirm(t('confirmDelete'))) return;
-  try { await api('/api/providers?id='+id, {method:'DELETE'}); renderCurrentView(); toast(t('providerDeleted'), 'success'); }
+  try { await api('/api/providers?id='+encodeURIComponent(id), {method:'DELETE'}); renderCurrentView(); toast(t('providerDeleted'), 'success'); }
   catch(e) { toast(e.message, 'error'); }
 }
 
 // ============ Activity ============
 async function renderActivity(main) {
-  main.innerHTML = `<div class="toolbar"><h2>${t('activity')}</h2><button class="btn danger small" onclick="clearActivity()">${t('clear')}</button></div><div class="feed" id="activity-feed"></div><div class="empty" id="activity-empty" style="display:none">${t('noEvents')}</div>`;
+  main.innerHTML = `<div class="toolbar"><h2>${esc(t('activity'))}</h2><button class="btn danger small" id="btn-clear-activity">${esc(t('clear'))}</button></div><div class="feed" id="activity-feed"></div><div class="empty" id="activity-empty" style="display:none">${esc(t('noEvents'))}</div>`;
+  document.getElementById('btn-clear-activity').onclick = clearActivity;
   try {
     const list = await api('/api/activity');
-    renderFeed(document.getElementById('activity-feed'), list, t('noEvents'), document.getElementById('activity-empty'));
+    activityItems = Array.isArray(list) ? list : [];
+    renderFeed(document.getElementById('activity-feed'), activityItems, t('noEvents'), document.getElementById('activity-empty'));
   } catch(e) { toast(e.message, 'error'); }
 }
 async function clearActivity() {
-  try { await api('/api/activity', {method:'DELETE'}); renderCurrentView(); toast(t('cleared'), 'success'); }
+  try { await api('/api/activity', {method:'DELETE'}); activityItems = []; renderCurrentView(); toast(t('cleared'), 'success'); }
   catch(e) { toast(e.message, 'error'); }
 }
 
@@ -603,20 +724,26 @@ function renderFeed(container, items, emptyMsg, emptyEl) {
   if (!items || items.length === 0) {
     container.innerHTML = '';
     if (emptyEl) emptyEl.style.display = 'block';
-    else container.innerHTML = `<div class="empty">${emptyMsg}</div>`;
+    else container.innerHTML = `<div class="empty">${esc(emptyMsg)}</div>`;
     return;
   }
   if (emptyEl) emptyEl.style.display = 'none';
-  container.innerHTML = items.map(e => {
+  container.innerHTML = items.map((e, idx) => {
     const cls = e.type === 'blocked' ? 'red' : e.type === 'alert' ? 'yellow' : e.type === 'clean' ? 'green' : 'dim';
     const rules = (e.rule_ids||[]).map(id => `<span class="badge dim">${esc(id)}</span>`).join(' ');
     const protection = e.protection && e.protection !== 'protected' ? `<span class="badge yellow">${esc(e.protection)}</span>` : '';
     return `<div class="entry">
       <span class="time">${esc(e.time||'')}</span>
       <span class="type"><span class="badge ${cls}">${esc(e.type||'')}</span>${protection ? ' '+protection : ''}</span>
-      <span class="msg" onclick='showActivityDetails(${JSON.stringify(JSON.stringify(e))})' style="cursor:pointer">${esc(e.message || e.verdict || '')} ${rules ? '<span style="display:inline-flex;gap:4px;flex-wrap:wrap;margin-left:8px">'+rules+'</span>' : ''}</span>
+      <span class="msg" data-activity-idx="${idx}" style="cursor:pointer">${esc(e.message || e.verdict || '')} ${rules ? '<span style="display:inline-flex;gap:4px;flex-wrap:wrap;margin-left:8px">'+rules+'</span>' : ''}</span>
     </div>`;
   }).join('');
+  container.onclick = (ev) => {
+    const el = ev.target.closest('[data-activity-idx]');
+    if (!el) return;
+    const item = items[Number(el.dataset.activityIdx)];
+    if (item) showActivityDetails(item);
+  };
 }
 
 async function exportProfiles() {
@@ -632,25 +759,25 @@ async function importProfiles() {
   const raw = prompt('Paste profiles JSON');
   if (!raw) return;
   try {
-    await api('/api/providers/import', {method:'POST', headers:{'Content-Type':'application/json'}, body: raw});
+    await api('/api/providers/import', {method:'POST', body: raw});
     renderCurrentView();
     toast(t('importProfiles'), 'success');
   } catch(e) { toast(e.message, 'error'); }
 }
 
-function showActivityDetails(raw) {
-  const e = JSON.parse(raw);
-  const findings = (e.findings||[]).length ? (e.findings||[]).map(f => `<div class="probe-finding"><span class="sev ${f.severity}">[${f.severity}]</span>${esc(f.rule_id)} — ${esc(f.description||'')}</div>`).join('') : `<div class="empty">${t('noFindings')}</div>`;
+function showActivityDetails(e) {
+  const findings = (e.findings||[]).length ? (e.findings||[]).map(f => `<div class="probe-finding"><span class="sev ${safeSeverity(f.severity)}">[${esc(f.severity)}]</span>${esc(f.rule_id)} — ${esc(f.description||'')}</div>`).join('') : `<div class="empty">${esc(t('noFindings'))}</div>`;
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
-  overlay.innerHTML = `<div class="modal" style="width:760px;max-width:96vw"><h3>${esc(e.message||e.type||'')}</h3><div class="field"><label>${t('details')}</label><div class="td-mono">${esc(JSON.stringify({type:e.type,provider:e.provider,protocol:e.protocol,verdict:e.verdict,path:e.path,method:e.method,max_severity:e.max_severity,protection:e.protection}, null, 2))}</div></div>${e.request_body?`<div class="field"><label>${t('requestBody')}</label><div class="td-mono">${esc(e.request_body)}</div></div>`:''}<div class="field"><label>${t('findingsTitle')}</label>${findings}</div><div class="modal-actions"><button class="btn secondary" onclick="this.closest('.modal-overlay').remove()">${t('close')}</button></div></div>`;
+  overlay.innerHTML = `<div class="modal" style="width:760px;max-width:96vw"><h3>${esc(e.message||e.type||'')}</h3><div class="field"><label>${esc(t('details'))}</label><div class="td-mono">${esc(JSON.stringify({type:e.type,provider:e.provider,protocol:e.protocol,verdict:e.verdict,path:e.path,method:e.method,max_severity:e.max_severity,protection:e.protection}, null, 2))}</div></div>${e.request_body?`<div class="field"><label>${esc(t('requestBody'))}</label><div class="td-mono">${esc(e.request_body)}</div></div>`:''}<div class="field"><label>${esc(t('findingsTitle'))}</label>${findings}</div><div class="modal-actions"><button class="btn secondary" data-close="1">${esc(t('close'))}</button></div></div>`;
   document.body.appendChild(overlay);
+  overlay.querySelector('[data-close]').onclick = () => overlay.remove();
 }
 
 // ============ Proxy Management ============
 async function startProxy(providerId, mode='monitor') {
   try {
-    await api('/api/proxy/start', {method:'POST', headers:{'Content-Type':'application/json'},
+    await api('/api/proxy/start', {method:'POST',
       body: JSON.stringify({provider_id: providerId, listen_addr: '127.0.0.1:8787', mode})});
     toast(t('proxyStarted'), 'success');
     renderCurrentView();
@@ -668,11 +795,11 @@ function renderProxyControls(status, providers) {
   const mode = status.mode || 'monitor';
   return `<div class="scan-form">
     <div class="form-row-3">
-      <div class="field"><label>${t('activeProvider')}</label><select id="proxy-provider"><option value="">${t('selectProvider')}</option>${options}</select></div>
-      <div class="field"><label>${t('mode')}</label><select id="proxy-mode"><option value="monitor" ${mode==='monitor'?'selected':''}>monitor</option><option value="block" ${mode==='block'?'selected':''}>block</option></select></div>
+      <div class="field"><label>${esc(t('activeProvider'))}</label><select id="proxy-provider"><option value="">${esc(t('selectProvider'))}</option>${options}</select></div>
+      <div class="field"><label>${esc(t('mode'))}</label><select id="proxy-mode"><option value="monitor" ${mode==='monitor'?'selected':''}>monitor</option><option value="block" ${mode==='block'?'selected':''}>block</option></select></div>
       <div class="field" style="display:flex;align-items:flex-end;gap:8px">
-        <button class="btn" style="width:100%" onclick="startSelectedProxy()">${t('startProxy')}</button>
-        <button class="btn danger" style="width:100%" onclick="stopProxy()">${t('stopProxy')}</button>
+        <button class="btn" style="width:100%" onclick="startSelectedProxy()">${esc(t('startProxy'))}</button>
+        <button class="btn danger" style="width:100%" onclick="stopProxy()">${esc(t('stopProxy'))}</button>
       </div>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
@@ -686,7 +813,7 @@ async function startSelectedProxy() {
   const mode = document.getElementById('proxy-mode').value || 'monitor';
   if (!providerId) { toast(t('selectProvider'), 'error'); return; }
   try {
-    await api('/api/proxy/start', {method:'POST', headers:{'Content-Type':'application/json'},
+    await api('/api/proxy/start', {method:'POST',
       body: JSON.stringify({provider_id: providerId, listen_addr: '127.0.0.1:8787', mode})});
     toast(t('proxyStarted'), 'success');
     renderCurrentView();
@@ -701,21 +828,21 @@ async function copyClientBaseUrl() {
 // ============ Scan ============
 function renderScan(main) {
   main.innerHTML = `
-    <h2>${t('scan')}</h2>
+    <h2>${esc(t('scan'))}</h2>
     <div class="scan-form">
-      <div class="field"><label>${t('apiUrl')}</label><input id="scan-url" placeholder="https://api.example.com" onkeydown="if(event.key==='Enter')doScan()"></div>
+      <div class="field"><label>${esc(t('apiUrl'))}</label><input id="scan-url" placeholder="https://api.example.com" onkeydown="if(event.key==='Enter')doScan()"></div>
       <div class="form-row-3">
-        <div class="field"><label>${t('apiKey')}</label><input id="scan-key" type="password" placeholder="sk-..."></div>
-        <div class="field"><label>${t('modelField')}</label><input id="scan-model" placeholder="gpt-4o-mini"></div>
-        <div class="field" style="display:flex;align-items:flex-end"><button class="btn" style="width:100%" onclick="doScan()" id="scan-btn">${t('scanProvider')}</button></div>
+        <div class="field"><label>${esc(t('apiKey'))}</label><input id="scan-key" type="password" placeholder="sk-..."></div>
+        <div class="field"><label>${esc(t('modelField'))}</label><input id="scan-model" placeholder="gpt-4o-mini"></div>
+        <div class="field" style="display:flex;align-items:flex-end"><button class="btn" style="width:100%" onclick="doScan()" id="scan-btn">${esc(t('scanProvider'))}</button></div>
       </div>
       <div class="form-row-3">
-        <div class="field"><label>${t('protocol')}</label><select id="scan-protocol"><option value="auto">auto</option><option value="chat-completions">chat-completions</option><option value="responses">responses</option><option value="anthropic">anthropic</option></select></div>
-        <div class="field"><label>${t('scanPath')}</label><input id="scan-path" placeholder="/v1/chat/completions"></div>
+        <div class="field"><label>${esc(t('protocol'))}</label><select id="scan-protocol"><option value="auto">auto</option><option value="chat-completions">chat-completions</option><option value="responses">responses</option><option value="anthropic">anthropic</option></select></div>
+        <div class="field"><label>${esc(t('scanPath'))}</label><input id="scan-path" placeholder="/v1/chat/completions"></div>
       </div>
       <div id="scan-progress"></div>
     </div>
-    <div id="scan-result">${scanResult ? renderScanResultHTML(scanResult) : `<div class="empty">${t('noScanData')}</div>`}</div>`;
+    <div id="scan-result">${scanResult ? renderScanResultHTML(scanResult) : `<div class="empty">${esc(t('noScanData'))}</div>`}</div>`;
 }
 
 async function doScan() {
@@ -729,10 +856,10 @@ async function doScan() {
   scanInProgress = true;
   const btn = document.getElementById('scan-btn');
   btn.disabled = true;
-  document.getElementById('scan-progress').innerHTML = `<div class="scan-progress"><div class="spinner"></div>${t('scanningProbe')}</div>`;
+  document.getElementById('scan-progress').innerHTML = `<div class="scan-progress"><div class="spinner"></div>${esc(t('scanningProbe'))}</div>`;
   document.getElementById('scan-result').innerHTML = '';
   try {
-    const res = await api('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
+    const res = await api('/api/scan', {method:'POST',
       body: JSON.stringify({base_url:url, api_key:key, model:model, protocol:protocol, path:path})});
     scanResult = res;
     document.getElementById('scan-result').innerHTML = renderScanResultHTML(res);
@@ -750,52 +877,52 @@ function renderScanResultHTML(r) {
   const v = r.verdict || 'unknown';
   const probes = (r.probes||[]).map(p => {
     const cls = p.err ? 'err' : (p.saw_tool_call || (p.findings&&p.findings.length>0)) ? 'fail' : 'ok';
-    const findings = (p.findings||[]).map(f => `<div class="probe-finding"><span class="sev ${f.severity}">[${f.severity}]</span>${esc(f.rule_id)}: ${esc(f.match)}</div>`).join('');
+    const findings = (p.findings||[]).map(f => `<div class="probe-finding"><span class="sev ${safeSeverity(f.severity)}">[${esc(f.severity)}]</span>${esc(f.rule_id)}: ${esc(f.match)}</div>`).join('');
     return `<div class="probe-item ${cls}">
       <div class="probe-header">
         <span class="badge ${cls==='ok'?'green':cls==='fail'?'red':'yellow'}">${esc(p.protocol)}/${esc(p.name)}</span>
-        ${p.err ? `<span style="color:var(--red);font-size:12px">${esc(p.err)}</span>` : `<span style="color:var(--dim);font-size:12px">HTTP ${p.status} · ${p.duration_ms}ms</span>`}
+        ${p.err ? `<span style="color:var(--red);font-size:12px">${esc(p.err)}</span>` : `<span style="color:var(--dim);font-size:12px">HTTP ${Number(p.status)} · ${Number(p.duration_ms)}ms</span>`}
         ${p.saw_tool_call ? `<span class="badge red">TOOL_CALL</span>` : ''}
-        ${p.declared_tools ? `<span class="badge dim">${t('declared')}</span>` : `<span class="badge dim">${t('notDeclared')}</span>`}
-        ${p.findings && p.findings.length ? `<span class="badge yellow">${p.findings.length} ${t('findings')}</span>` : ''}
+        ${p.declared_tools ? `<span class="badge dim">${esc(t('declared'))}</span>` : `<span class="badge dim">${esc(t('notDeclared'))}</span>`}
+        ${p.findings && p.findings.length ? `<span class="badge yellow">${p.findings.length} ${esc(t('findings'))}</span>` : ''}
       </div>
       ${findings}
     </div>`;
   }).join('');
   const ioc = r.blocklist_hits && r.blocklist_hits.length ? `<div style="margin-bottom:12px">${r.blocklist_hits.map(h=>`<span class="badge red">${esc(h)}</span>`).join(' ')}</div>` : '';
-  const discovery = r.discovery && r.discovery.length ? `<div style="margin-bottom:12px">${r.discovery.map(d=>`<span class="badge ${d.supported?'green':'dim'}" title="${esc(d.endpoint||'')}">${esc(d.protocol)}: ${d.supported?t('supported'):t('notSupported')}</span>`).join(' ')}</div>` : '';
+  const discovery = r.discovery && r.discovery.length ? `<div style="margin-bottom:12px">${r.discovery.map(d=>`<span class="badge ${d.supported?'green':'dim'}" title="${esc(d.endpoint||'')}">${esc(d.protocol)}: ${d.supported?esc(t('supported')):esc(t('notSupported'))}</span>`).join(' ')}</div>` : '';
   const summary = lang === 'ru' ? r.summary_ru : r.summary_en;
   const notesData = lang === 'ru' ? (r.notes_ru || []) : (r.notes || []);
   const recommendationsData = lang === 'ru' ? (r.recommendations_ru || []) : (r.recommendations_en || []);
   const notes = notesData.map(n => `<div class="note-item">- ${esc(n)}</div>`).join('');
   const recommendations = recommendationsData.map(n => `<div class="note-item">- ${esc(n)}</div>`).join('');
-  const tls = r.tls ? `<span style="color:var(--dim);font-size:12px;margin-left:12px">${t('tls')}: ${esc(r.tls.issuer)} (${r.tls.age_days} ${t('ageDays')}, ${t('certValidUntil')} ${esc(r.tls.not_after || '')})</span>` : '';
-  const ips = r.resolved_ips && r.resolved_ips.length ? `<span style="color:var(--dim);font-size:12px;margin-left:12px">${t('resolved')}: ${esc(r.resolved_ips.join(', '))}</span>` : '';
+  const tls = r.tls ? `<span style="color:var(--dim);font-size:12px;margin-left:12px">${esc(t('tls'))}: ${esc(r.tls.issuer)} (${Number(r.tls.age_days)} ${esc(t('ageDays'))}, ${esc(t('certValidUntil'))} ${esc(r.tls.not_after || '')})</span>` : '';
+  const ips = r.resolved_ips && r.resolved_ips.length ? `<span style="color:var(--dim);font-size:12px;margin-left:12px">${esc(t('resolved'))}: ${esc(r.resolved_ips.join(', '))}</span>` : '';
   return `<div class="result-box">
     <div class="verdict-line">
-      <div class="verdict ${v}">${v.toUpperCase()}</div>
-      <div class="score-badge">${t('riskScore')}: ${r.risk_score||0}</div>
+      <div class="verdict ${safeVerdictClass(v)}">${esc(v.toUpperCase())}</div>
+      <div class="score-badge">${esc(t('riskScore'))}: ${Number(r.risk_score)||0}</div>
     </div>
     <div style="margin-bottom:12px">
-      <span class="badge ${r.official?'green':'dim'}">${t('official')}: ${r.official?t('yes'):t('no')}</span>
-      <span style="color:var(--dim);font-size:12px;margin-left:12px">${t('host')}: ${esc(r.host||'')}</span>
+      <span class="badge ${r.official?'green':'dim'}">${esc(t('official'))}: ${r.official?esc(t('yes')):esc(t('no'))}</span>
+      <span style="color:var(--dim);font-size:12px;margin-left:12px">${esc(t('host'))}: ${esc(r.host||'')}</span>
       ${tls}${ips}
     </div>
     ${discovery}
     ${ioc}
-    ${summary ? `<h3>${t('summary')}</h3><div class="note-list"><div class="note-item">${esc(summary)}</div></div>` : ''}
-    <h3>${t('probes')}</h3>
-    <div class="probe-list">${probes || `<div class="empty">${t('none')}</div>`}</div>
-    ${notes ? `<h3>${t('notes')}</h3><div class="note-list">${notes}</div>` : ''}
-    ${recommendations ? `<h3>${t('recommendations')}</h3><div class="note-list">${recommendations}</div>` : ''}
+    ${summary ? `<h3>${esc(t('summary'))}</h3><div class="note-list"><div class="note-item">${esc(summary)}</div></div>` : ''}
+    <h3>${esc(t('probes'))}</h3>
+    <div class="probe-list">${probes || `<div class="empty">${esc(t('none'))}</div>`}</div>
+    ${notes ? `<h3>${esc(t('notes'))}</h3><div class="note-list">${notes}</div>` : ''}
+    ${recommendations ? `<h3>${esc(t('recommendations'))}</h3><div class="note-list">${recommendations}</div>` : ''}
   </div>`;
 }
 
 // ============ Audit ============
 function renderAudit(main) {
   main.innerHTML = `
-    <div class="toolbar"><h2>${t('audit')}</h2><button class="btn" onclick="doAudit()" id="audit-btn">${t('runAudit')}</button></div>
-    <div id="audit-result">${auditResult ? renderAuditResultHTML(auditResult) : `<div class="empty">${t('noAuditData')}</div>`}</div>`;
+    <div class="toolbar"><h2>${esc(t('audit'))}</h2><button class="btn" onclick="doAudit()" id="audit-btn">${esc(t('runAudit'))}</button></div>
+    <div id="audit-result">${auditResult ? renderAuditResultHTML(auditResult) : `<div class="empty">${esc(t('noAuditData'))}</div>`}</div>`;
 }
 
 async function doAudit() {
@@ -803,7 +930,7 @@ async function doAudit() {
   auditInProgress = true;
   const btn = document.getElementById('audit-btn');
   btn.disabled = true;
-  document.getElementById('audit-result').innerHTML = `<div class="scan-progress"><div class="spinner"></div>${t('runningAudit')}</div>`;
+  document.getElementById('audit-result').innerHTML = `<div class="scan-progress"><div class="spinner"></div>${esc(t('runningAudit'))}</div>`;
   try {
     const res = await api('/api/audit');
     auditResult = res;
@@ -818,8 +945,8 @@ async function doAudit() {
 }
 
 function renderAuditResultHTML(checks) {
-  if (!Array.isArray(checks)) return `<div class="empty">${t('none')}</div>`;
-  const infected = checks.filter(c => c.status === 'infected' || c.status === 'warn').length;
+  if (!Array.isArray(checks)) return `<div class="empty">${esc(t('none'))}</div>`;
+  const infected = checks.filter(c => c.status === 'infected' || c.status === 'warn' || c.status === 'error').length;
   const verdict = infected ? `${infected} ${t('issues')}` : t('clean');
   const vColor = infected ? 'malicious' : 'no-active-injection-detected';
   return `<div class="result-box">
@@ -827,7 +954,7 @@ function renderAuditResultHTML(checks) {
       <div class="verdict ${vColor}">${esc(verdict)}</div>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>${t('check')}</th><th>${t('status')}</th><th>${t('details')}</th></tr></thead>
+      <thead><tr><th>${esc(t('check'))}</th><th>${esc(t('status'))}</th><th>${esc(t('details'))}</th></tr></thead>
       <tbody>${checks.map(c => {
         const cls = c.status==='infected'?'red':c.status==='warn'?'yellow':c.status==='error'?'yellow':'green';
         return `<tr><td>${esc(c.name)}</td><td><span class="badge ${cls}">${esc(c.status)}</span></td><td style="font-size:12px">${esc(c.detail)}</td></tr>`;
@@ -839,15 +966,16 @@ function renderAuditResultHTML(checks) {
 // ============ Rules ============
 async function renderRules(main) {
   main.innerHTML = `
-    <div class="toolbar"><h2>${t('rulesCatalog')}</h2><button class="btn secondary small" onclick="rulesCache=null;renderRules(document.getElementById('main'))">refresh</button></div>
+    <div class="toolbar"><h2>${esc(t('rulesCatalog'))}</h2><button class="btn secondary small" id="btn-refresh-rules">refresh</button></div>
     <div class="scan-form">
       <div class="form-row-3">
-        <div class="field"><label>${t('search')}</label><input id="rule-search" placeholder="dl-curl, credential, webhook..." oninput="applyRuleFilters()"></div>
-        <div class="field"><label>${t('severity')}</label><select id="rule-severity" onchange="applyRuleFilters()"><option value="">${t('all')}</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select></div>
-        <div class="field"><label>${t('category')}</label><select id="rule-category" onchange="applyRuleFilters()"><option value="">${t('all')}</option></select></div>
+        <div class="field"><label>${esc(t('search'))}</label><input id="rule-search" placeholder="dl-curl, credential, webhook..." oninput="applyRuleFilters()"></div>
+        <div class="field"><label>${esc(t('severity'))}</label><select id="rule-severity" onchange="applyRuleFilters()"><option value="">${esc(t('all'))}</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select></div>
+        <div class="field"><label>${esc(t('category'))}</label><select id="rule-category" onchange="applyRuleFilters()"><option value="">${esc(t('all'))}</option></select></div>
       </div>
     </div>
     <div id="rules-list"></div>`;
+  document.getElementById('btn-refresh-rules').onclick = () => { rulesCache = null; renderRules(document.getElementById('main')); };
   try {
     if (!rulesCache) rulesCache = await api('/api/rules');
     const categories = [...new Set((rulesCache||[]).map(r => r.category))].sort();
@@ -860,7 +988,7 @@ function applyRuleFilters() {
   const q = (document.getElementById('rule-search')?.value || '').toLowerCase().trim();
   const sev = document.getElementById('rule-severity')?.value || '';
   const cat = document.getElementById('rule-category')?.value || '';
-  const list = (rulesCache || []).filter(r => {
+  filteredRuleItems = (rulesCache || []).filter(r => {
     const desc = lang === 'ru' ? r.description_ru : r.description_en;
     const hay = [r.id, r.category, r.severity, r.pattern, desc].join(' ').toLowerCase();
     return (!q || hay.includes(q)) && (!sev || r.severity === sev) && (!cat || r.category === cat);
@@ -868,34 +996,45 @@ function applyRuleFilters() {
   const target = document.getElementById('rules-list');
   if (!target) return;
   target.innerHTML = `<div class="table-wrap"><table>
-    <thead><tr><th>${t('ruleId')}</th><th>${t('category')}</th><th>${t('severity')}</th><th>${t('description')}</th><th>${t('pattern')}</th></tr></thead>
-    <tbody>${list.map(r => {
+    <thead><tr><th>${esc(t('ruleId'))}</th><th>${esc(t('category'))}</th><th>${esc(t('severity'))}</th><th>${esc(t('description'))}</th><th>${esc(t('pattern'))}</th></tr></thead>
+    <tbody>${filteredRuleItems.map((r, idx) => {
       const cls = r.severity === 'high' ? 'red' : r.severity === 'medium' ? 'yellow' : 'dim';
       const desc = lang === 'ru' ? r.description_ru : r.description_en;
       return `<tr>
         <td class="td-mono">${esc(r.id)}</td>
         <td><span class="badge dim">${esc(r.category)}</span></td>
         <td><span class="badge ${cls}">${esc(r.severity)}</span></td>
-        <td><div>${esc(desc)}</div><div style="margin-top:8px"><button class="btn secondary small" onclick='showRuleExplain(${JSON.stringify(JSON.stringify(r))})'>${t('explain')}</button></div></td>
+        <td><div>${esc(desc)}</div><div style="margin-top:8px"><button class="btn secondary small" data-rule-idx="${idx}">${esc(t('explain'))}</button></div></td>
         <td class="td-mono" style="max-width:360px;word-break:break-all;color:var(--dim)">${esc(r.pattern)}</td>
       </tr>`;
     }).join('')}</tbody></table></div>`;
+  target.onclick = (ev) => {
+    const btn = ev.target.closest('[data-rule-idx]');
+    if (!btn) return;
+    const r = filteredRuleItems[Number(btn.dataset.ruleIdx)];
+    if (r) showRuleExplain(r);
+  };
 }
 
-function showRuleExplain(raw) {
-  const r = JSON.parse(raw);
+function showRuleExplain(r) {
   const desc = lang === 'ru' ? r.description_ru : r.description_en;
+  const sev = safeSeverity(r.severity);
+  const cls = sev === 'high' ? 'red' : sev === 'medium' ? 'yellow' : 'dim';
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
-  overlay.innerHTML = `<div class="modal" style="width:760px;max-width:96vw"><h3>${esc(r.id)}</h3><div class="field"><label>${t('category')}</label><div><span class="badge dim">${esc(r.category)}</span> <span class="badge ${r.severity==='high'?'red':r.severity==='medium'?'yellow':'dim'}">${esc(r.severity)}</span></div></div><div class="field"><label>${t('description')}</label><div>${esc(desc)}</div></div><div class="field"><label>${t('pattern')}</label><div class="td-mono">${esc(r.pattern)}</div></div><div class="modal-actions"><button class="btn secondary" onclick="this.closest('.modal-overlay').remove()">${t('close')}</button></div></div>`;
+  overlay.innerHTML = `<div class="modal" style="width:760px;max-width:96vw"><h3>${esc(r.id)}</h3><div class="field"><label>${esc(t('category'))}</label><div><span class="badge dim">${esc(r.category)}</span> <span class="badge ${cls}">${esc(r.severity)}</span></div></div><div class="field"><label>${esc(t('description'))}</label><div>${esc(desc)}</div></div><div class="field"><label>${esc(t('pattern'))}</label><div class="td-mono">${esc(r.pattern)}</div></div><div class="modal-actions"><button class="btn secondary" data-close="1">${esc(t('close'))}</button></div></div>`;
   document.body.appendChild(overlay);
+  overlay.querySelector('[data-close]').onclick = () => overlay.remove();
 }
 
 // ============ Init ============
+document.querySelectorAll('.lang-btn').forEach(b => {
+  b.addEventListener('click', () => setLang(b.dataset.lang));
+});
 renderNav();
 renderCurrentView();
-setInterval(() => { if (currentView === 'overview') renderOverview(document.getElementById('main')); }, 5000);
-setInterval(() => { if (currentView === 'activity') renderActivity(document.getElementById('main')); }, 5000);
+connectActivityStream();
+setInterval(() => { if (currentView === 'overview') refreshStatusCardsOnly(); }, 10000);
 </script>
 </body>
 </html>

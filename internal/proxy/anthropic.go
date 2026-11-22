@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/vanndh/holone/internal/inspect"
@@ -15,15 +16,32 @@ type anthropicEvent struct {
 	Type         string `json:"type"`
 	Index        int    `json:"index"`
 	ContentBlock struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
+		Type     string          `json:"type"`
+		Name     string          `json:"name"`
+		Text     string          `json:"text"`
+		Thinking string          `json:"thinking"`
+		Input    json.RawMessage `json:"input"`
 	} `json:"content_block"`
 	Delta struct {
 		Type        string `json:"type"`
 		Text        string `json:"text"`
+		Thinking    string `json:"thinking"`
+		Signature   string `json:"signature"`
 		PartialJSON string `json:"partial_json"`
 		StopReason  string `json:"stop_reason"`
 	} `json:"delta"`
+}
+
+const maxSignatureSample = 16 << 10
+
+// inlineToolInput returns the JSON string of an inline content_block.input if
+// it carries actual arguments (not empty, null, or "{}").
+func inlineToolInput(raw json.RawMessage) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" || s == "{}" {
+		return ""
+	}
+	return s
 }
 
 // streamAnthropic handles an Anthropic Messages SSE response.
@@ -38,6 +56,8 @@ func (p *Proxy) streamAnthropic(w http.ResponseWriter, flusher http.Flusher, r *
 	// old 1 MiB cap cannot slip through.
 	toolBuf := map[int]*streamInspector{}
 	text := newStreamInspector(p.cfg.Engine, "text")
+	thinking := newStreamInspector(p.cfg.Engine, "thinking")
+	var sigBuf strings.Builder
 
 	onLine := func(b []byte) error { return writeAndFlush(w, flusher, b) }
 	onEvent := func(ev sseEvent) error {
@@ -47,9 +67,23 @@ func (p *Proxy) streamAnthropic(w http.ResponseWriter, flusher http.Flusher, r *
 		}
 		switch ae.Type {
 		case "content_block_start":
-			if ae.ContentBlock.Type == "tool_use" {
+			switch ae.ContentBlock.Type {
+			case "tool_use":
 				st.checkToolCall(ae.ContentBlock.Name)
-				toolBuf[ae.Index] = newStreamInspector(p.cfg.Engine, "tool_use:"+ae.ContentBlock.Name)
+				si := newToolStreamInspector(p.cfg.Engine, "tool_use:"+ae.ContentBlock.Name, ae.ContentBlock.Name)
+				if in := inlineToolInput(ae.ContentBlock.Input); in != "" {
+					si.Write(in)
+				}
+				toolBuf[ae.Index] = si
+			case "thinking":
+				thinking.Write(`"thinking": "`)
+				if ae.ContentBlock.Thinking != "" {
+					thinking.Write(ae.ContentBlock.Thinking)
+				}
+			case "text":
+				if ae.ContentBlock.Text != "" {
+					text.Write(ae.ContentBlock.Text)
+				}
 			}
 		case "content_block_delta":
 			switch ae.Delta.Type {
@@ -59,6 +93,20 @@ func (p *Proxy) streamAnthropic(w http.ResponseWriter, flusher http.Flusher, r *
 				}
 			case "text_delta":
 				text.Write(ae.Delta.Text)
+			case "thinking_delta":
+				if ae.Delta.Thinking != "" {
+					thinking.Write(ae.Delta.Thinking)
+					st.add(p.cfg.Engine.Inspect(ev.data, "thinking")...)
+				}
+			case "signature_delta":
+				if ae.Delta.Signature != "" && sigBuf.Len() < maxSignatureSample {
+					rem := maxSignatureSample - sigBuf.Len()
+					if len(ae.Delta.Signature) > rem {
+						sigBuf.WriteString(ae.Delta.Signature[:rem])
+					} else {
+						sigBuf.WriteString(ae.Delta.Signature)
+					}
+				}
 			}
 		case "content_block_stop":
 			if si := toolBuf[ae.Index]; si != nil {
@@ -76,7 +124,22 @@ func (p *Proxy) streamAnthropic(w http.ResponseWriter, flusher http.Flusher, r *
 	for _, si := range toolBuf {
 		st.add(si.Finish()...)
 	}
+	if sigBuf.Len() > 0 {
+		st.add(p.cfg.Engine.Inspect(`"signature":"`+sigBuf.String()+`"`, "thinking-signature")...)
+	}
+	st.add(thinking.Finish()...)
 	st.add(text.Finish()...)
+}
+
+type anthropicBlockBuf struct {
+	index        int
+	name         string
+	raw          [][]byte
+	bytes        int
+	insp         *streamInspector
+	inlineInsp   *streamInspector
+	nameFindings []inspect.Finding
+	oversized    bool
 }
 
 // streamAnthropicBlock forwards text immediately but holds back tool_use blocks
@@ -84,16 +147,13 @@ func (p *Proxy) streamAnthropic(w http.ResponseWriter, flusher http.Flusher, r *
 // with a safe note.
 func (p *Proxy) streamAnthropicBlock(w http.ResponseWriter, flusher http.Flusher, r *bufio.Reader, st *streamState) {
 	text := newStreamInspector(p.cfg.Engine, "text")
+	thinking := newStreamInspector(p.cfg.Engine, "thinking")
+	var sigBuf strings.Builder
 
-	buffering := false
-	var bufIndex int
-	var bufName string
-	var bufRaw [][]byte
-	var bufBytes int
-	var bufInspect *streamInspector
-	var nameFindings []inspect.Finding
-	oversized := false
-	droppedTool := false
+	active := map[int]*anthropicBlockBuf{}
+	emittedTools := 0
+	droppedTools := 0
+	terminated := false
 
 	emit := func(b []byte) error { return writeAndFlush(w, flusher, b) }
 
@@ -101,34 +161,56 @@ func (p *Proxy) streamAnthropicBlock(w http.ResponseWriter, flusher http.Flusher
 	// (clean) or replaces it with a safe note (malicious / undeclared /
 	// oversized). Used at content_block_stop and again at EOF for a truncated,
 	// never-stopped block.
-	finalizeTool := func() error {
-		findings := bufInspect.Finish()
+	finalizeTool := func(b *anthropicBlockBuf) error {
+		findings := b.insp.Finish()
+		if b.inlineInsp != nil {
+			findings = append(findings, b.inlineInsp.Finish()...)
+		}
 		st.add(findings...)
 		drop := inspect.MaxSeverity(findings) == inspect.SevHigh ||
-			inspect.MaxSeverity(nameFindings) == inspect.SevHigh ||
-			len(st.declaredTools) == 0 || oversized
-		buffering = false
+			inspect.MaxSeverity(b.nameFindings) == inspect.SevHigh ||
+			len(st.declaredTools) == 0 || b.oversized
 		if !drop {
-			for _, raw := range bufRaw {
+			emittedTools++
+			for _, raw := range b.raw {
 				if e := emit(raw); e != nil {
 					return e
 				}
 			}
 			return nil
 		}
-		droppedTool = true
+		droppedTools++
 		reason := "unsolicited tool call"
 		switch {
-		case oversized:
-			f := oversizedToolFinding(bufName)
+		case b.oversized:
+			f := oversizedToolFinding(b.name)
 			st.add(f)
 			reason = f.RuleID
 		case len(findings) > 0:
-			reason = findings[0].RuleID
-		case len(nameFindings) > 0:
-			reason = nameFindings[0].RuleID
+			reason = firstRuleID(findings, b.nameFindings)
+		case len(b.nameFindings) > 0:
+			reason = b.nameFindings[0].RuleID
 		}
-		return emitAnthropicNote(w, flusher, bufIndex, reason)
+		return emitAnthropicNote(w, flusher, b.index, reason)
+	}
+
+	finalizeAllOpen := func() error {
+		if len(active) == 0 {
+			return nil
+		}
+		idxs := make([]int, 0, len(active))
+		for idx := range active {
+			idxs = append(idxs, idx)
+		}
+		sort.Ints(idxs)
+		for _, idx := range idxs {
+			b := active[idx]
+			delete(active, idx)
+			if err := finalizeTool(b); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	onEvent := func(ev sseEvent) error {
@@ -137,51 +219,89 @@ func (p *Proxy) streamAnthropicBlock(w http.ResponseWriter, flusher http.Flusher
 			return emit(ev.raw) // unknown frame: pass through untouched
 		}
 
-		if buffering {
+		if b := active[ae.Index]; b != nil && (ae.Type == "content_block_delta" || ae.Type == "content_block_stop") {
 			delta := ""
 			if ae.Type == "content_block_delta" && ae.Delta.Type == "input_json_delta" {
 				delta = ae.Delta.PartialJSON
 			}
-			if !oversized {
-				bufBytes += len(ev.raw) + len(delta)
-				if bufBytes > maxToolCallBytes {
+			if !b.oversized {
+				b.bytes += len(ev.raw) + len(delta)
+				if b.bytes > maxToolCallBytes {
 					// Fail closed: stop retaining the call, keep consuming the
 					// stream until the block closes so the client stream stays
 					// well-formed, and drop it at finalize.
-					oversized = true
-					bufRaw = nil
-					bufBytes = 0
+					b.oversized = true
+					b.raw = nil
+					b.bytes = 0
 				} else {
-					bufRaw = append(bufRaw, ev.raw)
-					bufInspect.Write(delta)
+					b.raw = append(b.raw, ev.raw)
+					b.insp.Write(delta)
 				}
 			}
-			if ae.Type == "content_block_stop" && ae.Index == bufIndex {
-				return finalizeTool()
+			if ae.Type == "content_block_stop" {
+				delete(active, ae.Index)
+				return finalizeTool(b)
 			}
 			return nil
 		}
 
 		switch ae.Type {
 		case "content_block_start":
-			if ae.ContentBlock.Type == "tool_use" {
-				buffering = true
-				bufIndex = ae.Index
-				bufName = ae.ContentBlock.Name
-				bufRaw = [][]byte{ev.raw}
-				bufBytes = len(ev.raw)
-				bufInspect = newStreamInspector(p.cfg.Engine, "tool_use:"+bufName)
-				nameFindings = st.checkToolCall(bufName)
-				oversized = false
+			switch ae.ContentBlock.Type {
+			case "tool_use":
+				b := &anthropicBlockBuf{
+					index:        ae.Index,
+					name:         ae.ContentBlock.Name,
+					raw:          [][]byte{ev.raw},
+					bytes:        len(ev.raw),
+					insp:         newToolStreamInspector(p.cfg.Engine, "tool_use:"+ae.ContentBlock.Name, ae.ContentBlock.Name),
+					nameFindings: st.checkToolCall(ae.ContentBlock.Name),
+				}
+				if in := inlineToolInput(ae.ContentBlock.Input); in != "" {
+					b.inlineInsp = newToolStreamInspector(p.cfg.Engine, "tool_use:"+ae.ContentBlock.Name, ae.ContentBlock.Name)
+					b.inlineInsp.Write(in)
+				}
+				active[ae.Index] = b
 				return nil
+			case "thinking":
+				thinking.Write(`"thinking": "`)
+				if ae.ContentBlock.Thinking != "" {
+					thinking.Write(ae.ContentBlock.Thinking)
+				}
+			case "text":
+				if ae.ContentBlock.Text != "" {
+					text.Write(ae.ContentBlock.Text)
+				}
 			}
 		case "content_block_delta":
-			if ae.Delta.Type == "text_delta" {
+			switch ae.Delta.Type {
+			case "text_delta":
 				text.Write(ae.Delta.Text)
+			case "thinking_delta":
+				if ae.Delta.Thinking != "" {
+					thinking.Write(ae.Delta.Thinking)
+					st.add(p.cfg.Engine.Inspect(ev.data, "thinking")...)
+				}
+			case "signature_delta":
+				if ae.Delta.Signature != "" && sigBuf.Len() < maxSignatureSample {
+					rem := maxSignatureSample - sigBuf.Len()
+					if len(ae.Delta.Signature) > rem {
+						sigBuf.WriteString(ae.Delta.Signature[:rem])
+					} else {
+						sigBuf.WriteString(ae.Delta.Signature)
+					}
+				}
 			}
 		case "message_delta":
-			if droppedTool && ae.Delta.StopReason == "tool_use" {
+			if err := finalizeAllOpen(); err != nil {
+				return err
+			}
+			if droppedTools > 0 && emittedTools == 0 && ae.Delta.StopReason == "tool_use" {
 				return emit(rewriteStopReason(ev.data))
+			}
+		case "message_stop":
+			if err := finalizeAllOpen(); err != nil {
+				return err
 			}
 		case "error":
 			st.add(p.cfg.Engine.Inspect(ev.data, "error-frame")...)
@@ -195,12 +315,15 @@ func (p *Proxy) streamAnthropicBlock(w http.ResponseWriter, flusher http.Flusher
 	onOversized := func(ruleID string, n int) error {
 		st.add(oversizedSSEFinding(ruleID, n))
 		st.blocked = true
-		idx := bufIndex
-		if !buffering {
-			idx = 0
+		terminated = true
+		idx := 0
+		if len(active) > 0 {
+			for k := range active {
+				idx = k
+				break
+			}
 		}
-		buffering = false
-		bufRaw, bufInspect = nil, nil
+		active = map[int]*anthropicBlockBuf{}
 		if e := emitAnthropicNote(w, flusher, idx, ruleID); e != nil {
 			return e
 		}
@@ -213,11 +336,15 @@ func (p *Proxy) streamAnthropicBlock(w http.ResponseWriter, flusher http.Flusher
 	_ = readSSE(r, nil, onEvent, onOversized)
 	// A tool_use block left open at EOF (truncated stream) must still be
 	// inspected and resolved, or it would be both undetected and silently lost.
-	if buffering {
-		_ = finalizeTool()
+	if !terminated {
+		_ = finalizeAllOpen()
 	}
+	if sigBuf.Len() > 0 {
+		st.add(p.cfg.Engine.Inspect(`"signature":"`+sigBuf.String()+`"`, "thinking-signature")...)
+	}
+	st.add(thinking.Finish()...)
 	st.add(text.Finish()...)
-	if droppedTool {
+	if droppedTools > 0 {
 		st.blocked = true
 	}
 }

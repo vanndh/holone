@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -118,10 +119,11 @@ type Options struct {
 	// Path overrides the endpoint path derived from the protocol. A leading
 	// "/" is resolved against the base URL's host; otherwise it is appended to
 	// the base URL's path. A full URL is used as-is.
-	Path     string
-	Engine   *inspect.Engine
-	Client   *http.Client
-	Progress ProgressFunc
+	Path            string
+	BlockPrivateIPs bool
+	Engine          *inspect.Engine
+	Client          *http.Client
+	Progress        ProgressFunc
 }
 
 // NormalizeProtocol validates a protocol name. Empty means auto.
@@ -190,8 +192,8 @@ func endpointURL(base *url.URL, protocol, pathOverride string) (string, error) {
 }
 
 // resolvePathOverride resolves an explicit --path value. Absolute URLs are used
-// as-is, origin-absolute paths keep their query, and relative paths are joined
-// to the base URL's path.
+// as-is, protocol-relative and origin-absolute paths keep their host/query, and
+// relative paths are joined to the base URL's path.
 func resolvePathOverride(base *url.URL, override string) (string, error) {
 	ref, err := url.Parse(override)
 	if err != nil {
@@ -204,6 +206,8 @@ func resolvePathOverride(base *url.URL, override string) (string, error) {
 	switch {
 	case ref.Host != "":
 		u.Scheme = base.Scheme
+		u.Host = ref.Host
+		u.Path = ref.Path
 	case strings.HasPrefix(override, "/"):
 		u.Path = ref.Path
 	default:
@@ -213,6 +217,62 @@ func resolvePathOverride(base *url.URL, override string) (string, error) {
 	u.RawQuery = ref.RawQuery
 	u.Fragment = ""
 	return u.String(), nil
+}
+
+const maxScanRedirects = 5
+
+func checkScanRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) > maxScanRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxScanRedirects)
+	}
+	if len(via) > 0 && !sameScanOrigin(via[0].URL, req.URL) {
+		return errors.New("cross-origin redirect blocked (refusing to forward API key)")
+	}
+	return nil
+}
+
+func sameScanOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if !strings.EqualFold(a.Scheme, b.Scheme) || !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if strings.EqualFold(u.Scheme, "https") {
+			return "443"
+		}
+		if strings.EqualFold(u.Scheme, "http") {
+			return "80"
+		}
+		return ""
+	}
+	return port(a) == port(b)
+}
+
+func isPrivateOrLocalIP(ip net.IP) bool {
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified())
+}
+
+func validateNonPrivateTarget(host string, resolvedIPs []string) error {
+	lh := strings.ToLower(strings.Trim(host, "[]"))
+	if lh == "" || lh == "localhost" || strings.HasSuffix(lh, ".localhost") ||
+		strings.HasSuffix(lh, ".local") || strings.HasSuffix(lh, ".internal") ||
+		lh == "metadata.google.internal" {
+		return fmt.Errorf("refusing to scan private/local host %q", host)
+	}
+	if ip := net.ParseIP(lh); isPrivateOrLocalIP(ip) {
+		return fmt.Errorf("refusing to scan private/loopback IP %s", ip)
+	}
+	for _, s := range resolvedIPs {
+		if ip := net.ParseIP(s); isPrivateOrLocalIP(ip) {
+			return fmt.Errorf("refusing to scan host %q resolving to private/loopback IP %s", host, ip)
+		}
+	}
+	return nil
 }
 
 // Scan runs all probes concurrently and returns a report.
@@ -232,9 +292,18 @@ func Scan(ctx context.Context, opt Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	client := opt.Client
-	if client == nil {
-		client = &http.Client{Timeout: 45 * time.Second}
+	var client *http.Client
+	if opt.Client == nil {
+		client = &http.Client{
+			Timeout:       45 * time.Second,
+			CheckRedirect: checkScanRedirect,
+		}
+	} else {
+		copied := *opt.Client
+		if copied.CheckRedirect == nil {
+			copied.CheckRedirect = checkScanRedirect
+		}
+		client = &copied
 	}
 
 	res := &Result{
@@ -245,12 +314,22 @@ func Scan(ctx context.Context, opt Options) (*Result, error) {
 	}
 
 	// Phase 1: structural checks (fast, concurrent).
-	bl, _ := inspect.DefaultBlocklist()
+	bl := opt.Engine.Blocklist()
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(1)
 	go func() { defer wg.Done(); res.ResolvedIPs = resolveIPs(ctx, u.Hostname()) }()
-	go func() { defer wg.Done(); res.TLS = probeTLS(u) }()
+	if !opt.BlockPrivateIPs {
+		wg.Add(1)
+		go func() { defer wg.Done(); res.TLS = probeTLS(u) }()
+	}
 	wg.Wait()
+
+	if opt.BlockPrivateIPs {
+		if err := validateNonPrivateTarget(u.Hostname(), res.ResolvedIPs); err != nil {
+			return nil, err
+		}
+		res.TLS = probeTLS(u)
+	}
 
 	res.BlocklistHits = matchBlocklist(u.Hostname(), res.ResolvedIPs, bl)
 
@@ -270,61 +349,142 @@ func Scan(ctx context.Context, opt Options) (*Result, error) {
 	}
 
 	prompt := "Reply with a single short sentence greeting. Do not call any tools."
-	discovery := make([]Discovery, len(probeProtocols))
-	noTool := make([]ProbeResult, len(probeProtocols))
-	var dwg sync.WaitGroup
-	for i, p := range probeProtocols {
-		dwg.Add(1)
-		go func(idx int, protocol string) {
-			defer dwg.Done()
-			pr := probe(ctx, client, opt, endpoints[protocol], protocol, "no-tool", bodyFor(protocol, modelFor(protocol, opt.Model), prompt, false))
-			noTool[idx] = pr
-			discovery[idx] = Discovery{
-				Protocol:  protocol,
-				Endpoint:  endpoints[protocol],
-				Supported: discoverySupported(pr),
-				Status:    pr.Status,
-				Err:       pr.Err,
-			}
-			if opt.Progress != nil {
-				opt.Progress(protocol+"/no-tool", probeStatus(pr), len(pr.Findings), pr.Err)
-			}
-		}(i, p)
+	runDiscovery := func(modelOverride string) ([]Discovery, []ProbeResult) {
+		discovery := make([]Discovery, len(probeProtocols))
+		noTool := make([]ProbeResult, len(probeProtocols))
+		var dwg sync.WaitGroup
+		for i, p := range probeProtocols {
+			dwg.Add(1)
+			go func(idx int, protocol string) {
+				defer dwg.Done()
+				pr := probe(ctx, client, opt, endpoints[protocol], protocol, "no-tool",
+					bodyFor(protocol, modelFor(protocol, modelOverride), prompt, false, false), false)
+				noTool[idx] = pr
+				discovery[idx] = Discovery{
+					Protocol:  protocol,
+					Endpoint:  endpoints[protocol],
+					Supported: discoverySupported(pr),
+					Status:    pr.Status,
+					Err:       pr.Err,
+				}
+				if opt.Progress != nil {
+					opt.Progress(protocol+"/no-tool", probeStatus(pr), len(pr.Findings), pr.Err)
+				}
+			}(i, p)
+		}
+		dwg.Wait()
+		return discovery, noTool
 	}
-	dwg.Wait()
+
+	effectiveModel := opt.Model
+	discovery, noTool := runDiscovery(effectiveModel)
+
+	// Best-effort /v1/models fallback if no explicit model was supplied and
+	// every discovery request failed with HTTP 400 (commonly unknown model id).
+	if effectiveModel == "" && allBadRequest(noTool) {
+		if fallbackModel := discoverFirstModel(ctx, client, u, opt.APIKey); fallbackModel != "" {
+			effectiveModel = fallbackModel
+			discovery, noTool = runDiscovery(effectiveModel)
+		}
+	}
 	res.Discovery = discovery
 
 	// Phase 3: behavioral probes. The discovery responses double as the
-	// no-tool probes; only the supported layouts get a with-tools request.
+	// no-tool probes; only the supported layouts get with-tools and
+	// stream-no-tool requests.
 	selected := selectProtocols(mode, discovery)
 	byProtocol := make(map[string]int, len(probeProtocols))
 	for i, p := range probeProtocols {
 		byProtocol[p] = i
 	}
 
-	res.Probes = make([]ProbeResult, 0, len(selected)*2)
+	res.Probes = make([]ProbeResult, 0, len(selected)*3)
 	for _, p := range selected {
 		res.Probes = append(res.Probes, noTool[byProtocol[p]])
 	}
 
 	withTools := make([]ProbeResult, len(selected))
+	streamNoTool := make([]ProbeResult, len(selected))
 	var pw sync.WaitGroup
 	for i, p := range selected {
-		pw.Add(1)
+		pw.Add(2)
 		go func(idx int, protocol string) {
 			defer pw.Done()
-			pr := probe(ctx, client, opt, endpoints[protocol], protocol, "with-tools", bodyFor(protocol, modelFor(protocol, opt.Model), prompt, true))
+			pr := probe(ctx, client, opt, endpoints[protocol], protocol, "with-tools",
+				bodyFor(protocol, modelFor(protocol, effectiveModel), prompt, true, false), false)
 			withTools[idx] = pr
 			if opt.Progress != nil {
 				opt.Progress(protocol+"/with-tools", probeStatus(pr), len(pr.Findings), pr.Err)
 			}
 		}(i, p)
+		go func(idx int, protocol string) {
+			defer pw.Done()
+			pr := probe(ctx, client, opt, endpoints[protocol], protocol, "stream-no-tool",
+				bodyFor(protocol, modelFor(protocol, effectiveModel), prompt, false, true), true)
+			streamNoTool[idx] = pr
+			if opt.Progress != nil {
+				opt.Progress(protocol+"/stream-no-tool", probeStatus(pr), len(pr.Findings), pr.Err)
+			}
+		}(i, p)
 	}
 	pw.Wait()
 	res.Probes = append(res.Probes, withTools...)
+	res.Probes = append(res.Probes, streamNoTool...)
 
 	scoreResult(res)
 	return res, nil
+}
+
+func allBadRequest(prs []ProbeResult) bool {
+	if len(prs) == 0 {
+		return false
+	}
+	for _, pr := range prs {
+		if pr.Status != http.StatusBadRequest {
+			return false
+		}
+	}
+	return true
+}
+
+func discoverFirstModel(ctx context.Context, client *http.Client, base *url.URL, apiKey string) string {
+	u := *base
+	path := u.Path
+	if !strings.HasSuffix(strings.ToLower(path), "/v1") {
+		path += "/v1"
+	}
+	u.Path = path + "/models"
+	u.RawPath = ""
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return ""
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("x-api-key", apiKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+	if err != nil {
+		return ""
+	}
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil || len(payload.Data) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(payload.Data[0].ID)
 }
 
 // modelFor returns the model id a protocol should ask for.
@@ -333,30 +493,51 @@ func modelFor(protocol, override string) string {
 		return override
 	}
 	if protocol == ProtocolAnthropic {
-		return "claude-3-5-sonnet-20241022"
+		return "claude-sonnet-4-20250514"
 	}
 	return "gpt-4o-mini"
 }
 
 // bodyFor builds the request body for one protocol.
-func bodyFor(protocol, model, prompt string, withTools bool) []byte {
+func bodyFor(protocol, model, prompt string, withTools, streaming bool) []byte {
+	var m map[string]any
 	switch protocol {
 	case ProtocolAnthropic:
-		if withTools {
-			return anthropicBodyWithTools(model, prompt)
+		m = map[string]any{
+			"model":      model,
+			"max_tokens": 128,
+			"messages":   []any{map[string]any{"role": "user", "content": prompt}},
 		}
-		return anthropicBody(model, prompt)
+		if withTools {
+			m["tools"] = []any{map[string]any{"name": "Bash", "description": "Run a shell command", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}}}
+		}
 	case ProtocolResponses:
-		if withTools {
-			return responsesBodyWithTools(model, prompt)
+		m = map[string]any{
+			"model": model,
+			"input": prompt,
 		}
-		return responsesBody(model, prompt)
+		if withTools {
+			m["tools"] = []any{map[string]any{
+				"type":        "function",
+				"name":        "run",
+				"description": "Run a shell command",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{"cmd": map[string]any{"type": "string"}}},
+			}}
+		}
 	default:
-		if withTools {
-			return openaiBodyWithTools(model, prompt)
+		m = map[string]any{
+			"model":    model,
+			"messages": []any{map[string]any{"role": "user", "content": prompt}},
 		}
-		return openaiBody(model, prompt)
+		if withTools {
+			m["tools"] = []any{map[string]any{"type": "function", "function": map[string]any{"name": "run", "description": "Run a shell command", "parameters": map[string]any{"type": "object", "properties": map[string]any{"cmd": map[string]any{"type": "string"}}}}}}
+		}
 	}
+	if streaming {
+		m["stream"] = true
+	}
+	b, _ := json.Marshal(m)
+	return b
 }
 
 func probeStatus(pr ProbeResult) string {
@@ -418,7 +599,7 @@ func selectProtocols(mode string, discovery []Discovery) []string {
 // ProbeResult.Err instead of being silent.
 const maxProbeBody = 4 << 20
 
-func probe(ctx context.Context, client *http.Client, opt Options, endpoint, proto, name string, body []byte) ProbeResult {
+func probe(ctx context.Context, client *http.Client, opt Options, endpoint, proto, name string, body []byte, streaming bool) ProbeResult {
 	pr := ProbeResult{Name: name, Protocol: proto, DeclaredTools: strings.Contains(name, "with-tools")}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
@@ -427,6 +608,9 @@ func probe(ctx context.Context, client *http.Client, opt Options, endpoint, prot
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "identity")
+	if streaming {
+		req.Header.Set("Accept", "text/event-stream")
+	}
 	if opt.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+opt.APIKey)
 		if proto == "anthropic" {
@@ -452,10 +636,55 @@ func probe(ctx context.Context, client *http.Client, opt Options, endpoint, prot
 		raw = raw[:maxProbeBody]
 	}
 	text := string(raw)
-	pr.SawToolCall = strings.Contains(text, `"tool_use"`) ||
-		strings.Contains(text, `"tool_calls"`) ||
-		strings.Contains(text, `"function_call"`)
-	pr.Findings = opt.Engine.Inspect(text, "scan:"+proto+":"+name)
+
+	var findings []inspect.Finding
+	seen := make(map[string]struct{})
+	addFindings := func(fs ...inspect.Finding) {
+		for _, f := range fs {
+			key := f.RuleID + "\x00" + f.Match
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			findings = append(findings, f)
+		}
+	}
+
+	is2xx := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if is2xx {
+		pr.SawToolCall = strings.Contains(text, `"tool_use"`) ||
+			strings.Contains(text, `"tool_calls"`) ||
+			strings.Contains(text, `"function_call"`)
+	}
+
+	addFindings(opt.Engine.Inspect(text, "scan:"+proto+":"+name)...)
+	if strings.ContainsRune(text, '\\') {
+		if unesc := inspect.UnescapeJSONEscapes(text); unesc != text {
+			addFindings(opt.Engine.Inspect(unesc, "scan:"+proto+":"+name)...)
+		}
+	}
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") ||
+		strings.HasPrefix(text, "data:") || strings.HasPrefix(text, "event:") || strings.Contains(text, "\ndata:") {
+		sseText, sseNames := extractSSEProbeTextAndNames(text)
+		if sseText != "" {
+			addFindings(opt.Engine.Inspect(sseText, "scan:"+proto+":"+name)...)
+			if strings.ContainsRune(sseText, '\\') {
+				if unesc := inspect.UnescapeJSONEscapes(sseText); unesc != sseText {
+					addFindings(opt.Engine.Inspect(unesc, "scan:"+proto+":"+name)...)
+				}
+			}
+		}
+		if is2xx && len(sseNames) > 0 {
+			pr.SawToolCall = true
+		}
+		if is2xx && pr.DeclaredTools {
+			checkDeclaredNames(proto, sseNames, addFindings)
+		}
+	} else if is2xx && pr.DeclaredTools {
+		checkDeclaredNames(proto, extractJSONToolNames(raw), addFindings)
+	}
+
+	pr.Findings = findings
 	inspect.SortFindings(pr.Findings)
 	if resp.StatusCode >= 400 {
 		pr.Err = fmt.Sprintf("HTTP %d", resp.StatusCode)
@@ -471,64 +700,162 @@ func probe(ctx context.Context, client *http.Client, opt Options, endpoint, prot
 	return pr
 }
 
-func anthropicBody(model, prompt string) []byte {
-	b, _ := json.Marshal(map[string]any{
-		"model":      model,
-		"max_tokens": 128,
-		"messages":   []any{map[string]any{"role": "user", "content": prompt}},
-	})
-	return b
+func checkDeclaredNames(proto string, returned []string, add func(...inspect.Finding)) {
+	expected := "run"
+	if proto == ProtocolAnthropic {
+		expected = "Bash"
+	}
+	for _, n := range returned {
+		if n != "" && n != expected {
+			add(inspect.Finding{
+				RuleID:      inspect.RuleAnomalyToolNameNotDeclared,
+				Category:    "protocol-anomaly",
+				Severity:    inspect.SevHigh.String(),
+				Match:       n,
+				Source:      "scan:" + proto + ":with-tools",
+				Description: fmt.Sprintf("The provider returned undeclared tool call %q (expected only %q).", n, expected),
+			})
+		}
+	}
 }
 
-func anthropicBodyWithTools(model, prompt string) []byte {
-	b, _ := json.Marshal(map[string]any{
-		"model":      model,
-		"max_tokens": 128,
-		"messages":   []any{map[string]any{"role": "user", "content": prompt}},
-		"tools":      []any{map[string]any{"name": "Bash", "description": "Run a shell command", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}}},
-	})
-	return b
+func extractJSONToolNames(raw []byte) []string {
+	var m struct {
+		Content []struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"content"`
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+				FunctionCall *struct {
+					Name string `json:"name"`
+				} `json:"function_call"`
+			} `json:"message"`
+		} `json:"choices"`
+		Output []struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"output"`
+	}
+	if json.Unmarshal(raw, &m) != nil {
+		return nil
+	}
+	var names []string
+	for _, c := range m.Content {
+		if c.Type == "tool_use" && c.Name != "" {
+			names = append(names, c.Name)
+		}
+	}
+	for _, ch := range m.Choices {
+		for _, tc := range ch.Message.ToolCalls {
+			if tc.Function.Name != "" {
+				names = append(names, tc.Function.Name)
+			}
+		}
+		if ch.Message.FunctionCall != nil && ch.Message.FunctionCall.Name != "" {
+			names = append(names, ch.Message.FunctionCall.Name)
+		}
+	}
+	for _, o := range m.Output {
+		if o.Type == "function_call" && o.Name != "" {
+			names = append(names, o.Name)
+		}
+	}
+	return names
 }
 
-func openaiBody(model, prompt string) []byte {
-	b, _ := json.Marshal(map[string]any{
-		"model":    model,
-		"messages": []any{map[string]any{"role": "user", "content": prompt}},
-	})
-	return b
-}
-
-func openaiBodyWithTools(model, prompt string) []byte {
-	b, _ := json.Marshal(map[string]any{
-		"model":    model,
-		"messages": []any{map[string]any{"role": "user", "content": prompt}},
-		"tools":    []any{map[string]any{"type": "function", "function": map[string]any{"name": "run", "description": "Run a shell command", "parameters": map[string]any{"type": "object", "properties": map[string]any{"cmd": map[string]any{"type": "string"}}}}}},
-	})
-	return b
-}
-
-// responsesBody is the smallest valid OpenAI Responses API request.
-func responsesBody(model, prompt string) []byte {
-	b, _ := json.Marshal(map[string]any{
-		"model": model,
-		"input": prompt,
-	})
-	return b
-}
-
-// responsesBodyWithTools declares a tool in the Responses API's flat shape.
-func responsesBodyWithTools(model, prompt string) []byte {
-	b, _ := json.Marshal(map[string]any{
-		"model": model,
-		"input": prompt,
-		"tools": []any{map[string]any{
-			"type":        "function",
-			"name":        "run",
-			"description": "Run a shell command",
-			"parameters":  map[string]any{"type": "object", "properties": map[string]any{"cmd": map[string]any{"type": "string"}}},
-		}},
-	})
-	return b
+func extractSSEProbeTextAndNames(sse string) (string, []string) {
+	var sb strings.Builder
+	var names []string
+	for _, line := range strings.Split(sse, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var ev struct {
+			ContentBlock struct {
+				Type string `json:"type"`
+				Name string `json:"name"`
+			} `json:"content_block"`
+			Delta json.RawMessage `json:"delta"`
+			Item  struct {
+				Type      string `json:"type"`
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"item"`
+			Arguments string `json:"arguments"`
+			Choices   []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					ToolCalls []struct {
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+					FunctionCall *struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function_call"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(data), &ev) != nil {
+			continue
+		}
+		if ev.ContentBlock.Type == "tool_use" && ev.ContentBlock.Name != "" {
+			names = append(names, ev.ContentBlock.Name)
+		}
+		if ev.Item.Type == "function_call" && ev.Item.Name != "" {
+			names = append(names, ev.Item.Name)
+		}
+		if ev.Item.Arguments != "" {
+			sb.WriteString(ev.Item.Arguments)
+		}
+		if ev.Arguments != "" {
+			sb.WriteString(ev.Arguments)
+		}
+		var dStr string
+		if json.Unmarshal(ev.Delta, &dStr) == nil {
+			sb.WriteString(dStr)
+		} else {
+			var dObj struct {
+				Text        string `json:"text"`
+				Thinking    string `json:"thinking"`
+				PartialJSON string `json:"partial_json"`
+			}
+			if json.Unmarshal(ev.Delta, &dObj) == nil {
+				sb.WriteString(dObj.Text)
+				sb.WriteString(dObj.Thinking)
+				sb.WriteString(dObj.PartialJSON)
+			}
+		}
+		for _, ch := range ev.Choices {
+			sb.WriteString(ch.Delta.Content)
+			for _, tc := range ch.Delta.ToolCalls {
+				if tc.Function.Name != "" {
+					names = append(names, tc.Function.Name)
+				}
+				sb.WriteString(tc.Function.Arguments)
+			}
+			if ch.Delta.FunctionCall != nil {
+				if ch.Delta.FunctionCall.Name != "" {
+					names = append(names, ch.Delta.FunctionCall.Name)
+				}
+				sb.WriteString(ch.Delta.FunctionCall.Arguments)
+			}
+		}
+	}
+	return sb.String(), names
 }
 
 func resolveIPs(ctx context.Context, host string) []string {
@@ -542,9 +869,13 @@ func resolveIPs(ctx context.Context, host string) []string {
 
 func matchBlocklist(host string, ips []string, bl inspect.Blocklist) []string {
 	var hits []string
-	lhost := strings.ToLower(host)
+	lhost := strings.ToLower(strings.TrimSpace(host))
 	for _, d := range bl.Domains {
-		if strings.Contains(lhost, strings.ToLower(d)) {
+		ld := strings.ToLower(strings.TrimSpace(d))
+		if ld == "" {
+			continue
+		}
+		if lhost == ld || strings.HasSuffix(lhost, "."+ld) {
 			hits = append(hits, "domain:"+d)
 		}
 	}
@@ -668,5 +999,5 @@ func scoreResult(res *Result) {
 	}
 	res.SummaryEN, res.SummaryRU = scanSummary(res.Verdict, reachable, failed, toolCalls, highFindings, mediumOrLowFindings)
 	res.RecommendationsEN, res.RecommendationsRU = scanRecommendations(res)
-	addNote("A clean result does NOT prove safety — passive prompt logging cannot be detected. Do not send secrets to non-official providers.", "Чистый результат НЕ доказывает безопасность — пассивный слив промптов не детектируется. Не отправляй секреты неофициальным провайдерам.")
+	addNote("A clean result does NOT prove safety — passive prompt logging cannot be detected. Do not send secrets to non-official providers.", "Чистый результат НЕ доказывает безопасность — пассивное логирование промптов невидимо для canary-проб. Не отправляй секреты неофициальным провайдерам.")
 }

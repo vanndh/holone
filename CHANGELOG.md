@@ -4,6 +4,86 @@
 [keep a changelog](https://keepachangelog.com/), версионирование стремится
 следовать [semver](https://semver.org/).
 
+## [0.5.0] — 2026-11-22
+
+### безопасность
+
+- **dashboard XSS и CSRF/CSP**: в `ui/index.html` убраны inline-обработчики
+  `onclick` со строковой интерполяцией, добавлено экранирование полей провайдеров
+  и статуса; backend выставляет `X-Frame-Options: DENY` и `Content-Security-Policy`,
+  проверяет `Origin` / `Sec-Fetch-Site` и `Content-Type: application/json` на
+  мутирующих API-запросах, ограничивает тело API-запроса 1 MiB.
+- **dashboard SSRF и redirect-leak сканера**: `/api/scan` по умолчанию блокирует
+  локальные и приватные адреса (явное разрешение — `--allow-private-scan`).
+  `internal/scanner` разрешает только same-origin редиректы (до 5 шагов),
+  защищая заголовки авторизации от утечки на сторонний хост.
+- **закрыты обходы инспектора (Anthropic, OpenAI, Responses, JSON-escape)**:
+  - Anthropic SSE: инспектируется предзаполненный `content_block.input`,
+    блоки `thinking`/`thinking_delta`/`signature_delta`, буферы ведутся по
+    индексу блока (`map[int]*anthropicBlockBuf`) вместо единого флага.
+  - OpenAI Responses API: инспектируются завершающие события `*.done`,
+    `output_item.done`, `response.completed` (закрыт split-view bypass),
+    поддержаны `mcp_call`, `local_shell_call`, `shell_call`, `computer_call`,
+    `custom_tool_call`, `code_interpreter_call`, `output_text.done` и
+    `reasoning_summary_text.delta`.
+  - OpenAI Chat Completions: инспекция `reasoning_content` / `reasoning`, legacy
+    `delta.function_call`, принудительная финализация перед `data: [DONE]` и EOF.
+  - `inspect/toolargs.go`: декодирование JSON-escape последовательностей и
+    извлечение строковых листьев до проверки правил, плюс детект чтения/записи
+    чувствительных файлов (`cred-tool-sensitive-file`, `cfg-tool-sensitive-write`).
+- **полная передача тел запросов и hop-by-hop**: устранена потеря хвоста
+  запроса сверх 4 KiB при логировании в `dashboard` (`io.MultiReader`), а
+  `RequestBody` маскируется через `inspect.Redact`; `proxy` также вырезает
+  динамические заголовки, перечисленные в `Connection`.
+- **panic в `excerpt`**: исправлена работа со срезами UTF-8 в `excerpt`/`truncate`
+  при несовпадении длины байтов после `strings.ToLower`.
+
+### добавлено
+
+- **Egress DLP (`--egress-dlp off|warn|block|redact`)**: 12 детекторов секретов
+  (`dlp-*` в `internal/inspect/dlp.go`) в исходящих запросах к провайдеру.
+- **Google Gemini SSE (`--protocol gemini` / `auto`)**: Monitor + Block парсинг
+  `:streamGenerateContent`.
+- **Multi-provider маршрутизация (`/p/<id>/...`)**: `proxy.Router` проксирует
+  запросы на конкретного настроенного провайдера в dashboard.
+- **Конфиг-файл и политика правил (`--config`, `--disable-rule`)**: поддержка
+  `~/.holone/config.json`, отключение выбранных правил и `severity_overrides`
+  (`inspect.Policy`), флаг `--log-alerts-only`, выбор `--protocol` в `proxy`.
+- **Ротация JSONL-логов**: `rotatingLogWriter` (10 MiB на файл, до 3 бэкапов,
+  права `0600`).
+- **Расширенный аудит AI-клиентов и персистентности (`internal/sentinel`)**:
+  кросс-платформенная проверка `.claude/`, `.cursor/`, `.mcp.json`,
+  `CLAUDE.md`/`AGENTS.md`/`.cursorrules`, `.npmrc`, `pip.conf`, shell RC,
+  `.git/config` (`hooksPath`) и `.git/hooks/*`; Windows Registry `Run` и
+  исключения Defender; macOS/Linux `LaunchAgents`, user `systemd`, `crontab`;
+  поддержка `--rules` и `--blocklist` в `audit`/`sentinel`.
+- **Live SSE в дашборде (`/api/events`) и UI-авторизация по `--token`**.
+- **Расширенная редакция (`inspect.Redact`)**: PEM private keys, `github_pat_`,
+  Google `AIza…`, AWS STS `ASIA…`, URL Basic Auth и секреты в query-параметрах.
+- **Правила v6 (`rules/rules.json`, 109 правил)**: добавлены `dl-base64-pipe-sh`,
+  `dl-python-node-exec`, `net-reverse-shell-devtcp`, `net-reverse-shell-nc`,
+  русские описания `description_ru` для всех 109 правил.
+- **Сканер**: потоковая canary-проба `stream-no-tool`, проверка имён в
+  `with-tools`, fallback модели через `/v1/models` при `400` на пробах, учет
+  кастомного `Engine.Blocklist()`.
+
+### исправлено
+
+- убраны ложные срабатывания `fs-alternate-data-stream`, `supply-typosquat-pkg`,
+  `cfg-thinking-signature`, поправлены регэкспы `exec-kernel-driver`,
+  `defender-remove-definitions`, `exfil-file-upload-cloud` и пути `cred-*`.
+- исправлен дедлок в `ProxyManager.Start`, добавлен graceful shutdown по
+  `SIGINT`/`SIGTERM`, 2-часовой backoff для ошибок check-update (и отключение
+  проверки обновлений для `--json`/`version`/`help`), регистронезависимая
+  дедупликация proxy-переменных в `sentinel`, подсчёт `audit`-ошибок и
+  границы домена в `matchBlocklist`.
+
+### изменено
+
+- версия `0.5.0` (`cmd/holone`, `npm/package.json`, `npm/install.js`),
+  `release.yml` передаёт `-X main.version=${GITHUB_REF_NAME#v}`, `go.mod` →
+  `go 1.26.0`.
+
 ## [0.4.2] — 2026-10-21
 
 ### производительность

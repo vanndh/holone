@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vanndh/holone/internal/inspect"
 )
@@ -57,6 +58,33 @@ func ParseMode(s string) (Mode, error) {
 	}
 }
 
+// ParseProxyProtocol validates an explicit proxy wire-protocol override.
+// Empty or "auto" means infer from URL path and SSE frame sniffing.
+func ParseProxyProtocol(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "auto":
+		return "auto", nil
+	case "anthropic":
+		return "anthropic", nil
+	case "openai", "chat-completions":
+		return "openai", nil
+	case "responses":
+		return "responses", nil
+	case "gemini":
+		return "gemini", nil
+	default:
+		return "", fmt.Errorf("unknown protocol %q (want auto|anthropic|openai|responses|gemini)", s)
+	}
+}
+
+func normalizeProxyProtocol(s string) string {
+	p, err := ParseProxyProtocol(s)
+	if err != nil || p == "auto" {
+		return ""
+	}
+	return p
+}
+
 // Decision is the audit record emitted per inspected response.
 type Decision struct {
 	Time        string            `json:"time"`
@@ -85,11 +113,14 @@ const (
 
 // Config configures a Proxy.
 type Config struct {
-	Upstream   *url.URL
-	Engine     *inspect.Engine
-	Mode       Mode
-	Logger     *Logger
-	OnDecision func(Decision) // optional callback (CLI prints alerts)
+	Upstream      *url.URL
+	Engine        *inspect.Engine
+	Mode          Mode
+	Protocol      string  // optional override: auto | anthropic | openai | responses | gemini
+	EgressDLP     DLPMode // optional outbound secret inspection (off | warn | block | redact)
+	LogAlertsOnly bool    // skip writing clean decisions to Logger
+	Logger        *Logger
+	OnDecision    func(Decision) // optional callback (CLI prints alerts)
 
 	// MaxRequestBytes / MaxResponseBytes cap buffered bodies; zero means the
 	// defaults (32 MiB / 64 MiB). Bodies over the cap are rejected, never
@@ -198,6 +229,19 @@ var hopHeaders = []string{
 	"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
 }
 
+func stripHopHeaders(h http.Header) {
+	for _, connVal := range h.Values("Connection") {
+		for _, field := range strings.Split(connVal, ",") {
+			if name := strings.TrimSpace(field); name != "" {
+				h.Del(name)
+			}
+		}
+	}
+	for _, name := range hopHeaders {
+		h.Del(name)
+	}
+}
+
 const (
 	maxRequestBody  = 32 << 20 // default request-body cap (Config.MaxRequestBytes)
 	maxResponseBody = 64 << 20 // default buffered-response cap (Config.MaxResponseBytes)
@@ -210,8 +254,7 @@ const (
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Buffer the request body so we can both inspect it (to learn which tools
-	// the client declared) and forward it upstream. A body over the cap is
-	// rejected outright: forwarding a truncated request would corrupt it.
+	// the client declared and optionally apply egress DLP) and forward it upstream.
 	body, err := readBodyLimit(r.Body, p.maxRequest)
 	r.Body.Close()
 	if err != nil {
@@ -222,22 +265,59 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "holone: read request: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	declaredTools := declaredToolNames(body)
-	protocol := detectProtocol(r.URL.Path)
 
-	// Build the upstream request.
 	outURL := *p.cfg.Upstream
 	outURL.Path = singleJoin(p.cfg.Upstream.Path, r.URL.Path)
 	outURL.RawQuery = r.URL.RawQuery
+
+	protocol := normalizeProxyProtocol(p.cfg.Protocol)
+	if protocol == "" {
+		protocol = detectProtocol(r.URL.Path)
+		if protocol == "generic" {
+			protocol = detectProtocol(outURL.Path)
+		}
+	}
+
+	declaredTools := declaredToolNames(body)
+
+	var dlpFindings []inspect.Finding
+	switch p.cfg.EgressDLP {
+	case DLPModeWarn:
+		dlpFindings = inspect.InspectSecrets(string(body), "egress-request")
+	case DLPModeRedact:
+		redacted, hits := inspect.RedactSecrets(string(body), "egress-request")
+		if len(hits) > 0 {
+			body = []byte(redacted)
+			dlpFindings = hits
+		}
+	case DLPModeBlock:
+		dlpFindings = inspect.InspectSecrets(string(body), "egress-request")
+		if len(dlpFindings) > 0 {
+			st := &streamState{
+				proxy:         p,
+				protocol:      protocol,
+				declaredTools: declaredTools,
+				path:          r.URL.Path,
+				blocked:       true,
+			}
+			st.add(dlpFindings...)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"type":"error","error":{"type":"holone_dlp_blocked","message":"Request blocked by holone egress DLP: potential secret detected in outbound prompt."}}`))
+			p.report(st)
+			return
+		}
+	}
+
+	// Build the upstream request.
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "holone: build request: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	copyHeaders(outReq.Header, r.Header)
-	for _, h := range hopHeaders {
-		outReq.Header.Del(h)
-	}
+	stripHopHeaders(outReq.Header)
+	outReq.Header.Del("Content-Length")
 	// Force identity encoding so we can parse the response stream verbatim.
 	outReq.Header.Set("Accept-Encoding", "identity")
 	outReq.Host = p.cfg.Upstream.Host
@@ -263,10 +343,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	st := &streamState{
-		proxy:         p,
-		protocol:      protocol,
-		declaredTools: declaredTools,
-		path:          r.URL.Path,
+		proxy:          p,
+		protocol:       protocol,
+		declaredTools:  declaredTools,
+		path:           r.URL.Path,
+		egressFindings: dlpFindings,
 	}
 
 	isSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
@@ -324,6 +405,14 @@ func (p *Proxy) serveStream(w http.ResponseWriter, resp *http.Response, st *stre
 	flusher.Flush()
 
 	reader := bufio.NewReaderSize(body.r, 16<<10)
+	if st.protocol == "generic" {
+		var sniffed string
+		sniffed, reader = sniffSSEProtocol(reader)
+		if sniffed != "" {
+			st.protocol = sniffed
+		}
+	}
+
 	switch st.protocol {
 	case "anthropic":
 		p.streamAnthropic(w, flusher, reader, st)
@@ -331,10 +420,59 @@ func (p *Proxy) serveStream(w http.ResponseWriter, resp *http.Response, st *stre
 		p.streamOpenAI(w, flusher, reader, st)
 	case "responses":
 		p.streamResponses(w, flusher, reader, st)
+	case "gemini":
+		p.streamGemini(w, flusher, reader, st)
 	default:
 		p.streamGeneric(w, flusher, reader, st)
 	}
 	p.report(st)
+}
+
+// sniffSSEProtocol peeks the leading SSE lines (capped at 16 KiB) to classify
+// an unrecognized path by its wire frames, replaying every byte verbatim.
+func sniffSSEProtocol(r *bufio.Reader) (string, *bufio.Reader) {
+	const maxSniffBytes = 16 << 10
+	var buf bytes.Buffer
+	var proto string
+	for buf.Len() < maxSniffBytes {
+		frag, err := r.ReadSlice('\n')
+		if len(frag) > 0 {
+			buf.Write(frag)
+			line := buf.String()
+			switch {
+			case strings.Contains(line, `"object":"chat.completion.chunk"`),
+				strings.Contains(line, `"object": "chat.completion.chunk"`):
+				proto = "openai"
+			case strings.Contains(line, "event: message_start"),
+				strings.Contains(line, `"type":"message_start"`),
+				strings.Contains(line, `"type": "message_start"`),
+				strings.Contains(line, `"type":"content_block_start"`),
+				strings.Contains(line, `"type": "content_block_start"`):
+				proto = "anthropic"
+			case strings.Contains(line, "event: response.created"),
+				strings.Contains(line, `"type":"response.created"`),
+				strings.Contains(line, `"type": "response.created"`),
+				strings.Contains(line, `"type":"response.output_item.added"`),
+				strings.Contains(line, `"type": "response.output_item.added"`):
+				proto = "responses"
+			case (strings.Contains(line, `"candidates":[`) || strings.Contains(line, `"candidates": [`)) &&
+				(strings.Contains(line, `"parts":[`) || strings.Contains(line, `"parts": [`)):
+				proto = "gemini"
+			}
+			if proto != "" {
+				break
+			}
+			// Stop after the first complete frame (blank line) so unknown formats
+			// do not wait for more frames on an open stream.
+			if bytes.Equal(frag, []byte("\n")) || bytes.Equal(frag, []byte("\r\n")) {
+				break
+			}
+		}
+		if err != nil && err != bufio.ErrBufferFull {
+			break
+		}
+	}
+	return proto, bufio.NewReaderSize(io.MultiReader(bytes.NewReader(buf.Bytes()), r), 16<<10)
 }
 
 // serveBuffered handles non-streaming responses: buffer, inspect, then forward
@@ -350,18 +488,46 @@ func (p *Proxy) serveBuffered(w http.ResponseWriter, resp *http.Response, st *st
 		return
 	}
 	st.add(p.cfg.Engine.Inspect(string(raw), "response-body")...)
-	if names := responseToolNames(raw); len(names) > 0 {
-		for _, n := range names {
-			st.checkToolCall(n)
+
+	toolCalls := extractBufferedToolCalls(raw)
+	var toolFindings []inspect.Finding
+	hasToolAnomaly := false
+	if len(toolCalls) > 0 {
+		if st.protocol == "generic" && toolCalls[0].protocol != "" {
+			st.protocol = toolCalls[0].protocol
+		}
+		for _, tc := range toolCalls {
+			nf := st.checkToolCall(tc.name)
+			if len(nf) > 0 {
+				hasToolAnomaly = true
+			}
+			af := p.cfg.Engine.InspectToolArgs(tc.name, tc.args, "tool_call:"+tc.name)
+			st.add(af...)
+			toolFindings = append(toolFindings, nf...)
+			toolFindings = append(toolFindings, af...)
 		}
 	} else {
 		st.checkAnomaly(bodyMentionsTool(raw))
+		if st.sawTool && len(st.declaredTools) == 0 {
+			hasToolAnomaly = true
+		}
 	}
 
 	blocked := false
-	if p.cfg.Mode == ModeBlock && inspect.MaxSeverity(st.findings) == inspect.SevHigh {
-		raw = []byte(`{"type":"error","error":{"type":"holone_blocked","message":"Response blocked by holone: suspected malicious provider injection."}}`)
-		blocked = true
+	if p.cfg.Mode == ModeBlock {
+		if len(toolCalls) > 0 || bodyMentionsTool(raw) {
+			if inspect.MaxSeverity(toolFindings) == inspect.SevHigh || hasToolAnomaly ||
+				(len(toolCalls) == 0 && inspect.MaxSeverity(st.findings) == inspect.SevHigh) {
+				blocked = true
+			}
+		} else if !isStructuredTextResponse(raw) && inspect.MaxSeverity(st.findings) == inspect.SevHigh {
+			blocked = true
+		}
+	}
+
+	if blocked {
+		reason := firstRuleID(toolFindings, st.findings)
+		raw = bufferedBlockedPayload(st.protocol, reason)
 	}
 	st.blocked = blocked
 
@@ -377,8 +543,48 @@ func (p *Proxy) serveBuffered(w http.ResponseWriter, resp *http.Response, st *st
 	p.report(st)
 }
 
+func bufferedBlockedPayload(protocol, reason string) []byte {
+	switch protocol {
+	case "openai":
+		b, _ := json.Marshal(map[string]any{
+			"id":     "holone",
+			"object": "chat.completion",
+			"choices": []any{map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": fmt.Sprintf("[holone blocked a suspicious tool call: %s]", reason),
+				},
+				"finish_reason": "stop",
+			}},
+		})
+		return b
+	case "gemini":
+		b, _ := json.Marshal(map[string]any{
+			"candidates": []any{map[string]any{
+				"content": map[string]any{
+					"role":  "model",
+					"parts": []any{map[string]any{"text": fmt.Sprintf("[holone blocked a suspicious tool call: %s]", reason)}},
+				},
+				"finishReason": "STOP",
+			}},
+		})
+		return b
+	default:
+		b, _ := json.Marshal(map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "holone_blocked",
+				"message": fmt.Sprintf("Response blocked by holone: suspected malicious provider injection (%s).", reason),
+			},
+		})
+		return b
+	}
+}
+
 // report logs and surfaces the final decision for a request.
 func (p *Proxy) report(st *streamState) {
+	st.add(st.egressFindings...)
 	inspect.SortFindings(st.findings)
 	verdict := "clean"
 	if st.blocked {
@@ -397,7 +603,7 @@ func (p *Proxy) report(st *streamState) {
 		Protection:  protectionFor(st.protocol, p.cfg.Mode, st.streaming),
 		Findings:    st.findings,
 	}
-	if p.cfg.Logger != nil {
+	if p.cfg.Logger != nil && (!p.cfg.LogAlertsOnly || verdict != "clean") {
 		p.cfg.Logger.Log(d)
 	}
 	if p.cfg.OnDecision != nil && verdict != "clean" {
@@ -416,7 +622,7 @@ func protectionFor(protocol string, mode Mode, streaming bool) string {
 		return ProtectionProtected
 	}
 	switch protocol {
-	case "anthropic", "openai", "responses":
+	case "anthropic", "openai", "responses", "gemini":
 		return ProtectionProtected
 	default:
 		return ProtectionUnsupported
@@ -425,15 +631,16 @@ func protectionFor(protocol string, mode Mode, streaming bool) string {
 
 // streamState carries per-request inspection state.
 type streamState struct {
-	proxy         *Proxy
-	protocol      string
-	declaredTools map[string]struct{}
-	path          string
-	findings      []inspect.Finding
-	findingKeys   map[string]struct{}
-	sawTool       bool
-	blocked       bool
-	streaming     bool
+	proxy          *Proxy
+	protocol       string
+	declaredTools  map[string]struct{}
+	path           string
+	findings       []inspect.Finding
+	egressFindings []inspect.Finding
+	findingKeys    map[string]struct{}
+	sawTool        bool
+	blocked        bool
+	streaming      bool
 }
 
 // add appends findings, deduplicating by (rule id, match) so overlapping
@@ -460,23 +667,19 @@ func (s *streamState) checkAnomaly(sawTool bool) {
 		s.sawTool = true
 	}
 	if s.sawTool && len(s.declaredTools) == 0 {
-		s.add(unsolicitedToolFinding())
+		s.add(s.applyEnginePolicy(unsolicitedToolFinding())...)
 	}
 }
 
 // checkToolCall validates a returned tool call against the tools the client
 // declared and records a synthetic finding when it is anomalous. It returns the
 // findings it produced so a Block-mode path can decide on them immediately.
-//
-// The provider returning a name the client never declared is just as strong an
-// injection signal as returning any call at all; only the *name* and the
-// declared names are recorded, never the tool arguments.
 func (s *streamState) checkToolCall(name string) []inspect.Finding {
 	s.sawTool = true
 	if len(s.declaredTools) == 0 {
-		f := unsolicitedToolFinding()
-		s.add(f)
-		return []inspect.Finding{f}
+		fs := s.applyEnginePolicy(unsolicitedToolFinding())
+		s.add(fs...)
+		return fs
 	}
 	if name == "" {
 		return nil
@@ -492,7 +695,19 @@ func (s *streamState) checkToolCall(name string) []inspect.Finding {
 		Source:      "protocol",
 		Description: "The provider returned tool call \"" + truncate(name, 160) + "\", which the client never declared. Declared tools: " + declaredList(s.declaredTools) + ".",
 	}
-	s.add(f)
+	fs := s.applyEnginePolicy(f)
+	s.add(fs...)
+	return fs
+}
+
+func (s *streamState) applyEnginePolicy(f inspect.Finding) []inspect.Finding {
+	if s.proxy != nil && s.proxy.cfg.Engine != nil {
+		pf, ok := s.proxy.cfg.Engine.ApplyPolicy(f)
+		if !ok {
+			return nil
+		}
+		f = pf
+	}
 	return []inspect.Finding{f}
 }
 
@@ -538,12 +753,19 @@ func oversizedToolFinding(name string) inspect.Finding {
 	}
 }
 
-// truncate bounds a finding field (bytes, ASCII-safe for our use).
+// truncate bounds a finding field cleanly on a UTF-8 rune boundary.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "\u2026"
+	if n <= 0 {
+		return "\u2026"
+	}
+	cut := n
+	for cut > 0 && cut > n-utf8.UTFMax && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\u2026"
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -558,6 +780,8 @@ func detectProtocol(path string) string {
 		return "responses"
 	case strings.Contains(path, "/messages"):
 		return "anthropic"
+	case strings.Contains(path, ":streamGenerateContent"), strings.Contains(path, ":generateContent"):
+		return "gemini"
 	default:
 		return "generic"
 	}
@@ -568,15 +792,24 @@ func detectProtocol(path string) string {
 //	Anthropic        tools[].name
 //	OpenAI           tools[].function.name
 //	legacy OpenAI    functions[].name
+//	Gemini           tools[].functionDeclarations[].name
+//	Responses built-in tools[].type (local_shell, shell, computer_use_preview, code_interpreter)
 //
 // A nil result means the client declared no tools at all.
 func declaredToolNames(body []byte) map[string]struct{} {
 	var m struct {
 		Tools []struct {
+			Type     string `json:"type"`
 			Name     string `json:"name"`
 			Function struct {
 				Name string `json:"name"`
 			} `json:"function"`
+			FunctionDeclarations []struct {
+				Name string `json:"name"`
+			} `json:"functionDeclarations"`
+			FunctionDeclarationsSnake []struct {
+				Name string `json:"name"`
+			} `json:"function_declarations"`
 		} `json:"tools"`
 		Functions []struct {
 			Name string `json:"name"`
@@ -594,6 +827,29 @@ func declaredToolNames(body []byte) map[string]struct{} {
 		if n != "" {
 			names[n] = struct{}{}
 		}
+		for _, fd := range t.FunctionDeclarations {
+			if fd.Name != "" {
+				names[fd.Name] = struct{}{}
+			}
+		}
+		for _, fd := range t.FunctionDeclarationsSnake {
+			if fd.Name != "" {
+				names[fd.Name] = struct{}{}
+			}
+		}
+		if n == "" && t.Type != "" && t.Type != "function" {
+			names[t.Type] = struct{}{}
+			switch t.Type {
+			case "local_shell":
+				names["local_shell_call"] = struct{}{}
+			case "shell":
+				names["shell_call"] = struct{}{}
+			case "computer_use_preview":
+				names["computer_call"] = struct{}{}
+			case "code_interpreter":
+				names["code_interpreter_call"] = struct{}{}
+			}
+		}
 	}
 	for _, f := range m.Functions {
 		if f.Name != "" {
@@ -603,55 +859,103 @@ func declaredToolNames(body []byte) map[string]struct{} {
 	return names
 }
 
-// responseToolNames extracts tool-call names from a buffered (non-streaming)
-// response body so the same declared-name validation that runs on streams also
-// applies to whole-body responses (Anthropic, Chat Completions, legacy
-// function_call, Responses API).
-func responseToolNames(body []byte) []string {
+type bufferedToolCall struct {
+	protocol string
+	name     string
+	args     string
+}
+
+func extractBufferedToolCalls(body []byte) []bufferedToolCall {
 	var m struct {
 		Content []struct {
-			Type string `json:"type"`
-			Name string `json:"name"`
+			Type  string          `json:"type"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
 		} `json:"content"`
 		Choices []struct {
 			Message struct {
 				ToolCalls []struct {
 					Function struct {
-						Name string `json:"name"`
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
 					} `json:"function"`
 				} `json:"tool_calls"`
+				FunctionCall *struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function_call"`
 			} `json:"message"`
 		} `json:"choices"`
-		FunctionCall struct {
-			Name string `json:"name"`
+		FunctionCall *struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
 		} `json:"function_call"`
-		Output []struct {
-			Type string `json:"type"`
-			Name string `json:"name"`
-		} `json:"output"`
+		Output     []responsesItem `json:"output"`
+		Candidates []struct {
+			Content struct {
+				Parts []geminiPart `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
 	}
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil
 	}
-	var names []string
+	var out []bufferedToolCall
 	for _, c := range m.Content {
-		if c.Type == "tool_use" && c.Name != "" {
-			names = append(names, c.Name)
+		if c.Type == "tool_use" {
+			out = append(out, bufferedToolCall{protocol: "anthropic", name: c.Name, args: string(c.Input)})
 		}
 	}
 	for _, ch := range m.Choices {
 		for _, tc := range ch.Message.ToolCalls {
-			if tc.Function.Name != "" {
-				names = append(names, tc.Function.Name)
+			out = append(out, bufferedToolCall{protocol: "openai", name: tc.Function.Name, args: tc.Function.Arguments})
+		}
+		if fc := ch.Message.FunctionCall; fc != nil && (fc.Name != "" || fc.Arguments != "") {
+			out = append(out, bufferedToolCall{protocol: "openai", name: fc.Name, args: fc.Arguments})
+		}
+	}
+	if fc := m.FunctionCall; fc != nil && (fc.Name != "" || fc.Arguments != "") {
+		out = append(out, bufferedToolCall{protocol: "openai", name: fc.Name, args: fc.Arguments})
+	}
+	for _, o := range m.Output {
+		if isResponsesToolItem(o.Type) {
+			out = append(out, bufferedToolCall{protocol: "responses", name: itemCheckName(o), args: itemPayload(o)})
+		}
+	}
+	for _, cand := range m.Candidates {
+		for _, part := range cand.Content.Parts {
+			if fc := part.funcCall(); fc != nil {
+				out = append(out, bufferedToolCall{protocol: "gemini", name: fc.Name, args: string(fc.Args)})
 			}
 		}
 	}
-	if m.FunctionCall.Name != "" {
-		names = append(names, m.FunctionCall.Name)
+	return out
+}
+
+// isStructuredTextResponse reports whether raw is a structured LLM response
+// object containing only text/message content (never executed as tools).
+func isStructuredTextResponse(raw []byte) bool {
+	var m struct {
+		Content    []any `json:"content"`
+		Choices    []any `json:"choices"`
+		Output     []any `json:"output"`
+		Candidates []any `json:"candidates"`
 	}
-	for _, o := range m.Output {
-		if o.Type == "function_call" && o.Name != "" {
-			names = append(names, o.Name)
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return false
+	}
+	return len(m.Content) > 0 || len(m.Choices) > 0 || len(m.Output) > 0 || len(m.Candidates) > 0
+}
+
+// responseToolNames extracts tool-call names from a buffered (non-streaming)
+// response body so the same declared-name validation that runs on streams also
+// applies to whole-body responses (Anthropic, Chat Completions, legacy
+// function_call, Responses API, Gemini).
+func responseToolNames(body []byte) []string {
+	var names []string
+	for _, tc := range extractBufferedToolCalls(body) {
+		if tc.name != "" {
+			names = append(names, tc.name)
 		}
 	}
 	return names
@@ -663,7 +967,8 @@ func bodyMentionsTool(body []byte) bool {
 	s := string(body)
 	return strings.Contains(s, `"tool_use"`) ||
 		strings.Contains(s, `"tool_calls"`) ||
-		strings.Contains(s, `"function_call"`)
+		strings.Contains(s, `"function_call"`) ||
+		strings.Contains(s, `"functionCall"`)
 }
 
 func copyHeaders(dst, src http.Header) {
@@ -685,9 +990,7 @@ func writeResponseHeaders(w http.ResponseWriter, resp *http.Response, streaming,
 			w.Header().Add(k, v)
 		}
 	}
-	for _, h := range hopHeaders {
-		w.Header().Del(h)
-	}
+	stripHopHeaders(w.Header())
 	if decoded {
 		w.Header().Del("Content-Encoding")
 		w.Header().Del("Content-Length")

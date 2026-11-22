@@ -16,8 +16,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,6 +27,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/vanndh/holone/internal/dashboard"
@@ -34,7 +37,7 @@ import (
 	"github.com/vanndh/holone/internal/sentinel"
 )
 
-const version = "0.4.2"
+var version = "0.5.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -74,12 +77,15 @@ func usage() {
 	fmt.Print(`holone — client-independent guard against malicious LLM API providers
 
 USAGE:
-  holone proxy    --upstream <url> [--listen 127.0.0.1:8787] [--mode monitor|block] [--log <file>]
-                  [--max-request-size 32MiB] [--max-response-size 64MiB]
-  holone scan     <base-url> [--key <api-key>] [--model <name>] [--protocol auto|chat-completions|responses|anthropic] [--path <path>] [--json]
-  holone audit    [--json]
-  holone sentinel [--interval 30s]
-  holone dashboard [--listen 127.0.0.1:9090]
+  holone proxy     --upstream <url> [--listen 127.0.0.1:8787] [--mode monitor|block]
+                   [--protocol auto|anthropic|openai|responses|gemini] [--egress-dlp off|warn|block|redact]
+                   [--disable-rule <id,id>] [--log <file>] [--log-alerts-only] [--config <file>]
+                   [--max-request-size 32MiB] [--max-response-size 64MiB]
+  holone scan      <base-url> [--key <api-key>] [--model <name>] [--protocol auto|chat-completions|responses|anthropic] [--path <path>] [--rules <file>] [--blocklist <file>] [--json]
+  holone audit     [--rules <file>] [--blocklist <file>] [--json]
+  holone sentinel  [--interval 30s] [--rules <file>] [--blocklist <file>]
+  holone dashboard [--listen 127.0.0.1:9090] [--token <secret>] [--egress-dlp off|warn|block|redact]
+                   [--disable-rule <id,id>] [--log <file>] [--log-alerts-only] [--allow-private-scan] [--config <file>]
   holone version
 
 QUICK START:
@@ -100,11 +106,16 @@ func cmdProxy(args []string) error {
 	upstream := fs.String("upstream", "", "real provider base URL to forward to (required)")
 	listen := fs.String("listen", "127.0.0.1:8787", "local address to listen on")
 	modeStr := fs.String("mode", "monitor", "monitor | block")
+	protoStr := fs.String("protocol", "auto", "auto | anthropic | openai | responses | gemini")
+	dlpStr := fs.String("egress-dlp", "off", "off | warn | block | redact")
+	disableRulesStr := fs.String("disable-rule", "", "comma-separated rule IDs to disable")
 	logPath := fs.String("log", defaultLogPath(), "audit log file (jsonl); '-' for stdout")
+	logAlertsOnly := fs.Bool("log-alerts-only", false, "write only alert/blocked decisions to the jsonl log")
 	rulesPath := fs.String("rules", "", "optional custom rules.json (defaults to built-in)")
 	blockPath := fs.String("blocklist", "", "optional custom blocklist.json (defaults to built-in)")
 	maxReqStr := fs.String("max-request-size", "", "max buffered request body, e.g. 32MiB (default 32MiB)")
 	maxRespStr := fs.String("max-response-size", "", "max buffered response body, e.g. 64MiB (default 64MiB)")
+	configPath := fs.String("config", "", "optional config.json (defaults to ~/.holone/config.json if present)")
 	fs.Parse(args)
 
 	if *upstream == "" {
@@ -114,19 +125,52 @@ func cmdProxy(args []string) error {
 	if err != nil || up.Scheme == "" || up.Host == "" {
 		return fmt.Errorf("invalid --upstream %q", *upstream)
 	}
-	mode, err := proxy.ParseMode(*modeStr)
+
+	setFlags := visitedFlags(fs)
+	fcfg, err := loadConfigFile(*configPath, setFlags["config"])
 	if err != nil {
 		return err
 	}
-	eng, err := loadEngine(*rulesPath, *blockPath)
+	effMode := pickStr(setFlags["mode"], *modeStr, fcfg.Mode, "monitor")
+	effProto := pickStr(setFlags["protocol"], *protoStr, fcfg.Protocol, "auto")
+	effDLP := pickStr(setFlags["egress-dlp"], *dlpStr, fcfg.EgressDLP, "off")
+	effRules := pickStr(setFlags["rules"], *rulesPath, fcfg.Rules, "")
+	effBlock := pickStr(setFlags["blocklist"], *blockPath, fcfg.Blocklist, "")
+	effMaxReq := pickStr(setFlags["max-request-size"], *maxReqStr, fcfg.MaxRequestSize, "")
+	effMaxResp := pickStr(setFlags["max-response-size"], *maxRespStr, fcfg.MaxResponseSize, "")
+	effAlertsOnly := *logAlertsOnly
+	if !setFlags["log-alerts-only"] && fcfg.LogAlertsOnly {
+		effAlertsOnly = true
+	}
+
+	mode, err := proxy.ParseMode(effMode)
 	if err != nil {
 		return err
 	}
-	maxReq, err := parseByteSize(*maxReqStr)
+	proto, err := proxy.ParseProxyProtocol(effProto)
+	if err != nil {
+		return err
+	}
+	dlpMode, err := proxy.ParseDLPMode(effDLP)
+	if err != nil {
+		return err
+	}
+	eng, err := loadEngine(effRules, effBlock)
+	if err != nil {
+		return err
+	}
+	disabled := append([]string(nil), fcfg.DisableRules...)
+	disabled = append(disabled, parseRuleIDList(*disableRulesStr)...)
+	eng = eng.WithPolicy(inspect.Policy{
+		DisabledRules:     disabled,
+		SeverityOverrides: fcfg.SeverityOverrides,
+	})
+
+	maxReq, err := parseByteSize(effMaxReq)
 	if err != nil {
 		return fmt.Errorf("--max-request-size: %w", err)
 	}
-	maxResp, err := parseByteSize(*maxRespStr)
+	maxResp, err := parseByteSize(effMaxResp)
 	if err != nil {
 		return fmt.Errorf("--max-response-size: %w", err)
 	}
@@ -141,6 +185,9 @@ func cmdProxy(args []string) error {
 		Upstream:         up,
 		Engine:           eng,
 		Mode:             mode,
+		Protocol:         proto,
+		EgressDLP:        dlpMode,
+		LogAlertsOnly:    effAlertsOnly,
 		Logger:           proxy.NewLogger(logw),
 		OnDecision:       printDecision,
 		MaxRequestBytes:  maxReq,
@@ -154,9 +201,9 @@ func cmdProxy(args []string) error {
 		fmt.Printf("%s%s%s\n", yellow, warning, reset)
 	}
 	if mode == proxy.ModeBlock {
-		fmt.Printf("%s⚠  block mode is enforced for anthropic/openai/responses streams and buffered responses; unknown stream protocols run monitor-only (protection=unsupported).%s\n", yellow, reset)
+		fmt.Printf("%s⚠  block mode is enforced for anthropic/openai/responses/gemini streams and buffered tool responses; unknown stream protocols run monitor-only (protection=unsupported).%s\n", yellow, reset)
 	}
-	fmt.Printf("%sholone%s proxy listening on http://%s  (mode=%s, rules=%d)\n", bold, reset, *listen, mode, eng.RuleCount())
+	fmt.Printf("%sholone%s proxy listening on http://%s  (mode=%s, protocol=%s, egress-dlp=%s, rules=%d)\n", bold, reset, *listen, mode, proto, dlpMode, eng.RuleCount())
 	fmt.Printf("  forwarding to %s\n", up.String())
 	fmt.Printf("  point your client's API base URL at: http://%s\n", *listen)
 
@@ -168,7 +215,7 @@ func cmdProxy(args []string) error {
 		ReadHeaderTimeout: 15 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
-	return srv.ListenAndServe()
+	return serveWithGracefulShutdown(srv)
 }
 
 // --- scan ------------------------------------------------------------------
@@ -179,13 +226,19 @@ func cmdScan(args []string) error {
 	model := fs.String("model", "", "model name to request")
 	protocol := fs.String("protocol", "auto", "wire protocol: auto | chat-completions | responses | anthropic")
 	pathOverride := fs.String("path", "", "explicit endpoint path override (e.g. /v1/chat/completions)")
+	rulesPath := fs.String("rules", "", "optional custom rules.json (defaults to built-in)")
+	blockPath := fs.String("blocklist", "", "optional custom blocklist.json (defaults to built-in)")
 	asJSON := fs.Bool("json", false, "emit JSON report")
 	fs.Parse(normalizeScanArgs(args))
 
 	if fs.NArg() < 1 {
-		return fmt.Errorf("usage: holone scan <base-url> [--key KEY] [--model NAME] [--protocol auto|chat-completions|responses|anthropic] [--path PATH] [--json]")
+		return fmt.Errorf("usage: holone scan <base-url> [--key KEY] [--model NAME] [--protocol auto|chat-completions|responses|anthropic] [--path PATH] [--rules FILE] [--blocklist FILE] [--json]")
 	}
 	if _, err := scanner.NormalizeProtocol(*protocol); err != nil {
+		return err
+	}
+	eng, err := loadEngine(*rulesPath, *blockPath)
+	if err != nil {
 		return err
 	}
 	apiKey := *key
@@ -223,6 +276,7 @@ func cmdScan(args []string) error {
 		Model:    *model,
 		Protocol: *protocol,
 		Path:     *pathOverride,
+		Engine:   eng,
 		Progress: progress,
 	})
 	if err != nil {
@@ -248,28 +302,32 @@ func cmdScan(args []string) error {
 
 func cmdAudit(args []string) error {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
+	rulesPath := fs.String("rules", "", "optional custom rules.json (defaults to built-in)")
+	blockPath := fs.String("blocklist", "", "optional custom blocklist.json (defaults to built-in)")
 	asJSON := fs.Bool("json", false, "emit JSON report")
 	fs.Parse(args)
 
-	checks := sentinel.Audit(context.Background())
+	eng, err := loadEngine(*rulesPath, *blockPath)
+	if err != nil {
+		return err
+	}
+
+	checks := sentinel.AuditWithOptions(context.Background(), sentinel.Options{Engine: eng})
 	if *asJSON {
 		b, _ := json.MarshalIndent(checks, "", "  ")
 		fmt.Println(string(b))
 		return nil
 	}
-	infected := 0
+	issues := len(sentinel.Infected(checks))
 	fmt.Printf("%sholone audit%s — scanning this machine for known provider-malware indicators\n\n", bold, reset)
 	for _, c := range checks {
 		fmt.Printf("  %s  %-18s %s\n", statusBadge(c.Status), c.Name, c.Detail)
-		if c.Status == sentinel.StatusInfected || c.Status == sentinel.StatusWarn {
-			infected++
-		}
 	}
 	fmt.Println()
-	if infected == 0 {
+	if issues == 0 {
 		fmt.Printf("%sClean — no indicators found.%s\n", green, reset)
 	} else {
-		fmt.Printf("%s%d indicator(s) found — investigate immediately.%s\n", red, infected, reset)
+		fmt.Printf("%s%d indicator(s) found — investigate immediately.%s\n", red, issues, reset)
 	}
 	return nil
 }
@@ -279,16 +337,20 @@ func cmdAudit(args []string) error {
 func cmdSentinel(args []string) error {
 	fs := flag.NewFlagSet("sentinel", flag.ExitOnError)
 	interval := fs.Duration("interval", 30*time.Second, "re-scan interval")
+	rulesPath := fs.String("rules", "", "optional custom rules.json (defaults to built-in)")
+	blockPath := fs.String("blocklist", "", "optional custom blocklist.json (defaults to built-in)")
 	fs.Parse(args)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	eng, err := loadEngine(*rulesPath, *blockPath)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	fmt.Printf("%sholone sentinel%s watching for provider-malware indicators every %s (Ctrl-C to stop)\n", bold, reset, *interval)
-	for _, c := range sentinel.Infected(sentinel.Audit(ctx)) {
-		fmt.Printf("  %s  %-18s %s\n", statusBadge(c.Status), c.Name, c.Detail)
-	}
-	sentinel.Monitor(ctx, *interval, func(c sentinel.Check) {
+	sentinel.MonitorWithOptions(ctx, *interval, sentinel.Options{Engine: eng}, func(c sentinel.Check) {
 		fmt.Printf("%s[%s]%s %s  %-18s %s\n", dim, time.Now().Format("15:04:05"), reset, statusBadge(c.Status), c.Name, c.Detail)
 	})
 	fmt.Println("\nsentinel stopped.")
@@ -302,6 +364,15 @@ func cmdDashboard(args []string) error {
 	listen := fs.String("listen", "127.0.0.1:9090", "address to serve the dashboard on")
 	token := fs.String("token", "", "optional dashboard token (also accepts $HOLONE_DASHBOARD_TOKEN)")
 	logPath := fs.String("log", defaultLogPath(), "audit log file (jsonl); '-' for stdout")
+	logAlertsOnly := fs.Bool("log-alerts-only", false, "write only alert/blocked decisions to the jsonl log")
+	rulesPath := fs.String("rules", "", "optional custom rules.json (defaults to built-in)")
+	blockPath := fs.String("blocklist", "", "optional custom blocklist.json (defaults to built-in)")
+	dlpStr := fs.String("egress-dlp", "off", "off | warn | block | redact")
+	disableRulesStr := fs.String("disable-rule", "", "comma-separated rule IDs to disable")
+	maxReqStr := fs.String("max-request-size", "", "max buffered request body, e.g. 32MiB (default 32MiB)")
+	maxRespStr := fs.String("max-response-size", "", "max buffered response body, e.g. 64MiB (default 64MiB)")
+	allowPrivateScan := fs.Bool("allow-private-scan", false, "allow scanning localhost/private network endpoints from dashboard")
+	configPath := fs.String("config", "", "optional config.json (defaults to ~/.holone/config.json if present)")
 	fs.Parse(args)
 
 	if !listenIsLocal(*listen) {
@@ -311,16 +382,51 @@ func cmdDashboard(args []string) error {
 		*token = os.Getenv("HOLONE_DASHBOARD_TOKEN")
 	}
 
+	setFlags := visitedFlags(fs)
+	fcfg, err := loadConfigFile(*configPath, setFlags["config"])
+	if err != nil {
+		return err
+	}
+	effDLP := pickStr(setFlags["egress-dlp"], *dlpStr, fcfg.EgressDLP, "off")
+	effRules := pickStr(setFlags["rules"], *rulesPath, fcfg.Rules, "")
+	effBlock := pickStr(setFlags["blocklist"], *blockPath, fcfg.Blocklist, "")
+	effMaxReq := pickStr(setFlags["max-request-size"], *maxReqStr, fcfg.MaxRequestSize, "")
+	effMaxResp := pickStr(setFlags["max-response-size"], *maxRespStr, fcfg.MaxResponseSize, "")
+	effAlertsOnly := *logAlertsOnly
+	if !setFlags["log-alerts-only"] && fcfg.LogAlertsOnly {
+		effAlertsOnly = true
+	}
+
+	dlpMode, err := proxy.ParseDLPMode(effDLP)
+	if err != nil {
+		return err
+	}
+	maxReq, err := parseByteSize(effMaxReq)
+	if err != nil {
+		return fmt.Errorf("--max-request-size: %w", err)
+	}
+	maxResp, err := parseByteSize(effMaxResp)
+	if err != nil {
+		return fmt.Errorf("--max-response-size: %w", err)
+	}
+
 	providers, err := dashboard.LoadProviders()
 	if err != nil {
 		return fmt.Errorf("load providers: %w", err)
 	}
 	activity := dashboard.NewActivityLog(1000)
 
-	eng, err := inspect.Default()
+	eng, err := loadEngine(effRules, effBlock)
 	if err != nil {
 		return fmt.Errorf("load rules: %w", err)
 	}
+	disabled := append([]string(nil), fcfg.DisableRules...)
+	disabled = append(disabled, parseRuleIDList(*disableRulesStr)...)
+	eng = eng.WithPolicy(inspect.Policy{
+		DisabledRules:     disabled,
+		SeverityOverrides: fcfg.SeverityOverrides,
+	})
+
 	logw, closeLog, err := openLog(*logPath)
 	if err != nil {
 		return err
@@ -331,12 +437,13 @@ func cmdDashboard(args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		res, err := scanner.Scan(ctx, scanner.Options{
-			BaseURL:  req.BaseURL,
-			APIKey:   req.APIKey,
-			Model:    req.Model,
-			Protocol: req.Protocol,
-			Path:     req.Path,
-			Engine:   eng,
+			BaseURL:         req.BaseURL,
+			APIKey:          req.APIKey,
+			Model:           req.Model,
+			Protocol:        req.Protocol,
+			Path:            req.Path,
+			BlockPrivateIPs: !*allowPrivateScan,
+			Engine:          eng,
 		})
 		if err != nil {
 			return nil, err
@@ -351,13 +458,8 @@ func cmdDashboard(args []string) error {
 
 	auditFn := func() (any, error) {
 		ctx := context.Background()
-		checks := sentinel.Audit(ctx)
-		infected := 0
-		for _, c := range checks {
-			if c.Status == sentinel.StatusInfected || c.Status == sentinel.StatusWarn || c.Status == sentinel.StatusError {
-				infected++
-			}
-		}
+		checks := sentinel.AuditWithOptions(ctx, sentinel.Options{Engine: eng})
+		infected := len(sentinel.Infected(checks))
 		activity.Add(dashboard.ActivityEntry{
 			Type:    "audit",
 			Verdict: fmt.Sprintf("%d issues", infected),
@@ -367,25 +469,99 @@ func cmdDashboard(args []string) error {
 	}
 
 	srv := dashboard.New(dashboard.Config{
-		ListenAddr: *listen,
-		Token:      *token,
-		Providers:  providers,
-		Activity:   activity,
-		Engine:     eng,
-		ProxyLog:   proxy.NewLogger(logw),
-		ScanFn:     scanFn,
-		AuditFn:    auditFn,
+		Version:          version,
+		ListenAddr:       *listen,
+		Token:            *token,
+		Providers:        providers,
+		Activity:         activity,
+		Engine:           eng,
+		ProxyLog:         proxy.NewLogger(logw),
+		MaxRequestBytes:  maxReq,
+		MaxResponseBytes: maxResp,
+		EgressDLP:        dlpMode,
+		LogAlertsOnly:    effAlertsOnly,
+		AllowPrivateScan: *allowPrivateScan,
+		ScanFn:           scanFn,
+		AuditFn:          auditFn,
 	})
 
-	fmt.Printf("%sholone dashboard%s — http://%s\n", bold, reset, *listen)
+	fmt.Printf("%sholone dashboard%s (v%s) — http://%s\n", bold, reset, version, *listen)
 	fmt.Printf("  managed proxy default: http://127.0.0.1:8787\n")
 	if *token != "" {
 		fmt.Printf("  dashboard token: required via X-Holone-Token or ?token=...\n")
 	}
-	return srv.ListenAndServe()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+	select {
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+		err := <-errCh
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
 }
 
 // --- shared helpers --------------------------------------------------------
+
+func serveWithGracefulShutdown(srv *http.Server) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+	select {
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+		err := <-errCh
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
+
+func visitedFlags(fs *flag.FlagSet) map[string]bool {
+	m := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		m[f.Name] = true
+	})
+	return m
+}
+
+func pickStr(cliSet bool, cliVal, cfgVal, fallback string) string {
+	if cliSet {
+		return cliVal
+	}
+	if strings.TrimSpace(cfgVal) != "" {
+		return strings.TrimSpace(cfgVal)
+	}
+	if cliVal != "" {
+		return cliVal
+	}
+	return fallback
+}
 
 func loadEngine(rulesPath, blockPath string) (*inspect.Engine, error) {
 	if rulesPath == "" && blockPath == "" {
@@ -420,17 +596,15 @@ func defaultLogPath() string {
 	return filepath.Join(dir, "holone.log")
 }
 
-func openLog(path string) (*os.File, func(), error) {
+func openLog(path string) (io.Writer, func(), error) {
 	if path == "-" || path == "" {
 		return os.Stdout, func() {}, nil
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	w, err := openRotatingLog(path, defaultMaxLogBytes, defaultMaxLogBackups)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open log %q: %w", path, err)
+		return nil, nil, err
 	}
-	// Tighten perms even if the file pre-existed world-readable.
-	_ = f.Chmod(0o600)
-	return f, func() { f.Close() }, nil
+	return w, func() { _ = w.Close() }, nil
 }
 
 func printDecision(d proxy.Decision) {

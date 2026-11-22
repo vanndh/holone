@@ -1,8 +1,9 @@
 // Package sentinel performs client-independent, OS-level detection of the
 // post-exploitation indicators a malicious provider's payload leaves behind:
-// rogue processes, scheduled-task persistence, traffic redirection, and dropped
-// files. It runs entirely outside the request hot path. The same checks back
-// both `holone audit` (one-shot) and `holone sentinel` (continuous watch).
+// rogue processes, scheduled-task persistence, traffic redirection, dropped
+// files, and poisoned AI-client configurations. It runs entirely outside the
+// request hot path. The same checks back both `holone audit` (one-shot) and
+// `holone sentinel` (continuous watch).
 package sentinel
 
 import (
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -33,11 +35,45 @@ type Check struct {
 	Detail string `json:"detail"`
 }
 
+// Options configures an Audit or Monitor run.
+type Options struct {
+	Engine  *inspect.Engine
+	HomeDir string
+	WorkDir string
+}
+
 // Audit runs every available check once and returns the results.
 func Audit(ctx context.Context) []Check {
-	bl, _ := inspect.DefaultBlocklist()
-	checks := []Check{checkEnvProxy(bl)}
-	checks = append(checks, platformChecks(ctx, bl)...)
+	return AuditWithOptions(ctx, Options{})
+}
+
+// AuditWithOptions runs all checks using the provided engine and directories.
+func AuditWithOptions(ctx context.Context, opt Options) []Check {
+	eng := opt.Engine
+	if eng == nil {
+		eng, _ = inspect.Default()
+	}
+	var bl inspect.Blocklist
+	if eng != nil {
+		bl = eng.Blocklist()
+	} else {
+		bl, _ = inspect.DefaultBlocklist()
+	}
+
+	homeDir := opt.HomeDir
+	if homeDir == "" {
+		homeDir, _ = os.UserHomeDir()
+	}
+	workDir := opt.WorkDir
+	if workDir == "" {
+		workDir, _ = os.Getwd()
+	}
+
+	checks := []Check{
+		checkEnvProxy(bl),
+		checkAIConfigs(homeDir, workDir, eng),
+	}
+	checks = append(checks, platformChecks(ctx, homeDir, bl, eng)...)
 	return checks
 }
 
@@ -59,16 +95,29 @@ func Infected(checks []Check) []Check {
 	return out
 }
 
-// Monitor re-audits on each interval and reports newly flagged checks via
-// onAlert. It blocks until ctx is cancelled.
+// Monitor re-audits on each interval and reports newly flagged or changed
+// checks via onAlert. It blocks until ctx is cancelled.
 func Monitor(ctx context.Context, interval time.Duration, onAlert func(Check)) {
-	seen := map[string]string{} // name -> last reported status
+	MonitorWithOptions(ctx, interval, Options{}, onAlert)
+}
+
+// MonitorWithOptions re-audits on each interval using opt and reports newly
+// flagged or changed checks via onAlert until ctx is cancelled.
+func MonitorWithOptions(ctx context.Context, interval time.Duration, opt Options, onAlert func(Check)) {
+	monitorLoop(ctx, interval, func(c context.Context) []Check {
+		return AuditWithOptions(c, opt)
+	}, onAlert)
+}
+
+func monitorLoop(ctx context.Context, interval time.Duration, auditFn func(context.Context) []Check, onAlert func(Check)) {
+	seen := map[string]string{} // name -> last reported "status\x00detail"
 	run := func() {
-		for _, c := range Audit(ctx) {
-			if alerting(c.Status) && seen[c.Name] != c.Status {
+		for _, c := range auditFn(ctx) {
+			sig := c.Status + "\x00" + c.Detail
+			if alerting(c.Status) && seen[c.Name] != sig {
 				onAlert(c)
 			}
-			seen[c.Name] = c.Status
+			seen[c.Name] = sig
 		}
 	}
 	run()
@@ -89,23 +138,50 @@ func checkEnvProxy(bl inspect.Blocklist) Check {
 	c := Check{Name: "proxy-env-vars", Status: StatusClean, Detail: "no suspicious proxy environment variables"}
 	vars := []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
 	var hits []string
+	infected := false
+	seen := map[string]bool{}
+
 	for _, v := range vars {
 		val := os.Getenv(v)
 		if val == "" {
 			continue
 		}
+		key := v
+		if runtime.GOOS == "windows" {
+			key = strings.ToUpper(v)
+		} else {
+			key = strings.ToUpper(v) + "\x00" + val
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
 		low := strings.ToLower(val)
 		if strings.Contains(low, "socks") {
 			hits = append(hits, v+"="+val+" (SOCKS proxy)")
 		}
 		for _, ip := range bl.IPs {
-			if strings.Contains(val, ip) {
+			ip = strings.TrimSpace(ip)
+			if ip != "" && strings.Contains(val, ip) {
+				infected = true
 				hits = append(hits, v+"="+val+" (known-bad IP)")
+			}
+		}
+		for _, dom := range bl.Domains {
+			dom = strings.TrimSpace(dom)
+			if dom != "" && strings.Contains(low, strings.ToLower(dom)) {
+				infected = true
+				hits = append(hits, v+"="+val+" (known-bad domain)")
 			}
 		}
 	}
 	if len(hits) > 0 {
-		c.Status = StatusWarn
+		if infected {
+			c.Status = StatusInfected
+		} else {
+			c.Status = StatusWarn
+		}
 		c.Detail = strings.Join(hits, "; ")
 	}
 	return c

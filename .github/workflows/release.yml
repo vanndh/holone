@@ -34,7 +34,7 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           name="holone-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          go build -trimpath -ldflags="-s -w" -o "dist/$name" ./cmd/holone
+          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o "dist/$name" ./cmd/holone
       - uses: actions/upload-artifact@v4
         with:
           name: holone-${{ matrix.goos }}-${{ matrix.goarch }}

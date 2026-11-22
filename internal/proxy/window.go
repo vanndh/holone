@@ -1,6 +1,10 @@
 package proxy
 
-import "github.com/vanndh/holone/internal/inspect"
+import (
+	"strings"
+
+	"github.com/vanndh/holone/internal/inspect"
+)
 
 // The inspector runs over the *entire* stream, not just its head. A hostile
 // provider controls how the response is framed and can therefore place its
@@ -13,8 +17,9 @@ import "github.com/vanndh/holone/internal/inspect"
 // The overlap must be larger than the longest rule pattern so a signature that
 // straddles a window boundary is still seen in full.
 const (
-	inspectWindow  = 256 << 10 // 256 KiB per detection window
-	inspectOverlap = 8 << 10   // 8 KiB carried into the next window
+	inspectWindow   = 256 << 10 // 256 KiB per detection window
+	inspectOverlap  = 8 << 10   // 8 KiB carried into the next window
+	maxToolRawBytes = 256 << 10 // 256 KiB bounded JSON accumulation for structured tool-arg checks
 )
 
 // streamInspector incrementally inspects an unbounded stream in overlapping
@@ -23,6 +28,9 @@ const (
 type streamInspector struct {
 	eng      *inspect.Engine
 	source   string
+	toolName string
+	isTool   bool
+	toolRaw  []byte
 	pending  []byte
 	findings []inspect.Finding
 	seen     map[string]struct{}
@@ -32,10 +40,40 @@ func newStreamInspector(eng *inspect.Engine, source string) *streamInspector {
 	return &streamInspector{eng: eng, source: source, seen: make(map[string]struct{})}
 }
 
+func newToolStreamInspector(eng *inspect.Engine, source, toolName string) *streamInspector {
+	return &streamInspector{
+		eng:      eng,
+		source:   source,
+		toolName: toolName,
+		isTool:   true,
+		seen:     make(map[string]struct{}),
+	}
+}
+
+// SetToolName updates the associated tool name (for protocols where the name
+// arrives in a chunk after argument accumulation began).
+func (si *streamInspector) SetToolName(name string) {
+	if si == nil || name == "" {
+		return
+	}
+	si.toolName = name
+	if strings.HasSuffix(si.source, ":") {
+		si.source += name
+	}
+}
+
 // Write appends streamed text and inspects every window that has filled up.
 func (si *streamInspector) Write(s string) {
 	if si == nil || s == "" {
 		return
+	}
+	if si.isTool && len(si.toolRaw) < maxToolRawBytes {
+		rem := maxToolRawBytes - len(si.toolRaw)
+		if len(s) > rem {
+			si.toolRaw = append(si.toolRaw, s[:rem]...)
+		} else {
+			si.toolRaw = append(si.toolRaw, s...)
+		}
 	}
 	si.pending = append(si.pending, s...)
 	for len(si.pending) >= inspectWindow {
@@ -60,6 +98,10 @@ func (si *streamInspector) Finish() []inspect.Finding {
 		si.inspect(si.pending)
 		si.pending = nil
 	}
+	if si.isTool && len(si.toolRaw) > 0 {
+		si.addFindings(si.eng.InspectToolArgs(si.toolName, string(si.toolRaw), si.source))
+		si.toolRaw = nil
+	}
 	return si.findings
 }
 
@@ -75,7 +117,17 @@ func (si *streamInspector) inspect(b []byte) {
 	if len(b) == 0 {
 		return
 	}
-	for _, f := range si.eng.Inspect(string(b), si.source) {
+	s := string(b)
+	si.addFindings(si.eng.Inspect(s, si.source))
+	if strings.ContainsRune(s, '\\') {
+		if unescaped := inspect.UnescapeJSONEscapes(s); unescaped != s {
+			si.addFindings(si.eng.Inspect(unescaped, si.source))
+		}
+	}
+}
+
+func (si *streamInspector) addFindings(fs []inspect.Finding) {
+	for _, f := range fs {
 		key := f.RuleID + "\x00" + f.Match
 		if _, ok := si.seen[key]; ok {
 			continue

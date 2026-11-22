@@ -14,7 +14,13 @@ import (
 type openaiChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			Reasoning        string `json:"reasoning"`
+			FunctionCall     *struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"function_call"`
 			ToolCalls []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
@@ -33,13 +39,50 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 	toolArgs := map[int]*streamInspector{}
 	toolName := map[int]string{}
 	content := newStreamInspector(p.cfg.Engine, "text")
+	reasoning := newStreamInspector(p.cfg.Engine, "thinking")
+	startedReasoning := false
 	// oversized is only meaningful in Block mode, where tool-call chunks are
 	// buffered; it bounds the held-back data.
 	oversized := false
 
+	feedReasoning := func(txt string) {
+		if txt == "" {
+			return
+		}
+		if !startedReasoning {
+			startedReasoning = true
+			reasoning.Write(`"thinking": "`)
+		}
+		reasoning.Write(txt)
+	}
+
 	accumulate := func(c openaiChunk) (hasTool bool, finish string) {
 		for _, ch := range c.Choices {
 			content.Write(ch.Delta.Content)
+			feedReasoning(ch.Delta.ReasoningContent)
+			feedReasoning(ch.Delta.Reasoning)
+
+			if fc := ch.Delta.FunctionCall; fc != nil {
+				hasTool = true
+				const fcIdx = -1
+				if fc.Name != "" {
+					if _, seen := toolName[fcIdx]; !seen || toolName[fcIdx] != fc.Name {
+						toolName[fcIdx] = fc.Name
+						st.checkToolCall(fc.Name)
+					}
+				} else if toolArgs[fcIdx] == nil {
+					st.checkToolCall("")
+				}
+				if !oversized {
+					if toolArgs[fcIdx] == nil {
+						toolArgs[fcIdx] = newToolStreamInspector(p.cfg.Engine, "function_call:"+fc.Name, fc.Name)
+					} else if fc.Name != "" {
+						toolArgs[fcIdx].SetToolName(fc.Name)
+					}
+					toolArgs[fcIdx].Write(fc.Arguments)
+				}
+			}
+
 			for _, tc := range ch.Delta.ToolCalls {
 				hasTool = true
 				if tc.Function.Name != "" {
@@ -54,7 +97,9 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 				}
 				if !oversized {
 					if toolArgs[tc.Index] == nil {
-						toolArgs[tc.Index] = newStreamInspector(p.cfg.Engine, "tool_call:"+tc.Function.Name)
+						toolArgs[tc.Index] = newToolStreamInspector(p.cfg.Engine, "tool_call:"+tc.Function.Name, tc.Function.Name)
+					} else if tc.Function.Name != "" {
+						toolArgs[tc.Index].SetToolName(tc.Function.Name)
 					}
 					toolArgs[tc.Index].Write(tc.Function.Arguments)
 				}
@@ -92,6 +137,7 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 		}
 		_ = readSSE(r, onLine, onEvent, p.monitorOversized(st))
 		inspectTools()
+		st.add(reasoning.Finish()...)
 		st.add(content.Finish()...)
 		return
 	}
@@ -101,6 +147,7 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 	var bufContent []string // assistant text carried inside each buffered chunk
 	var bufBytes int
 	droppedTool := false
+	terminated := false
 	emit := func(b []byte) error { return writeAndFlush(w, flusher, b) }
 
 	firstToolName := func(names map[int]string) string {
@@ -125,16 +172,19 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 		drop := inspect.MaxSeverity(findings) == inspect.SevHigh ||
 			inspect.MaxSeverity(st.findings) == inspect.SevHigh ||
 			(st.sawTool && len(st.declaredTools) == 0) || oversized
+		wasOversized := oversized
+		oversized = false
+		bufBytes = 0
 		if st.sawTool && drop {
 			droppedTool = true
 			reason := "unsolicited tool call"
 			switch {
-			case oversized:
+			case wasOversized:
 				f := oversizedToolFinding(firstToolName(toolName))
 				st.add(f)
 				reason = f.RuleID
 			case len(findings) > 0:
-				reason = findings[0].RuleID
+				reason = firstRuleID(findings)
 			default:
 				for _, f := range st.findings {
 					if f.Severity == inspect.SevHigh.String() {
@@ -161,6 +211,7 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 			}
 			err := emit(openaiFinishChunk("stop"))
 			bufChunks, bufContent = nil, nil
+			toolArgs = map[int]*streamInspector{}
 			return err
 		}
 		for _, raw := range bufChunks {
@@ -169,6 +220,7 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 			}
 		}
 		bufChunks, bufContent = nil, nil
+		toolArgs = map[int]*streamInspector{}
 		if finishRaw != nil {
 			return emit(finishRaw)
 		}
@@ -178,6 +230,11 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 	onEvent := func(ev sseEvent) error {
 		data := strings.TrimSpace(ev.data)
 		if data == "[DONE]" {
+			if len(bufChunks) > 0 || oversized {
+				if e := finalize(nil, ""); e != nil {
+					return e
+				}
+			}
 			return emit(ev.raw)
 		}
 		var c openaiChunk
@@ -226,6 +283,7 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 	onOversized := func(ruleID string, n int) error {
 		st.add(oversizedSSEFinding(ruleID, n))
 		st.blocked = true
+		terminated = true
 		bufChunks, bufContent = nil, nil
 		toolArgs = map[int]*streamInspector{}
 		if e := emit(openaiNoteChunk(ruleID)); e != nil {
@@ -243,9 +301,10 @@ func (p *Proxy) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, r *buf
 	_ = readSSE(r, nil, onEvent, onOversized)
 	// Buffered tool calls with no finish chunk (EOF/disconnect) must still be
 	// inspected and resolved, not silently dropped.
-	if len(bufChunks) > 0 || oversized {
+	if !terminated && (len(bufChunks) > 0 || oversized) {
 		_ = finalize(nil, "")
 	}
+	st.add(reasoning.Finish()...)
 	st.add(content.Finish()...)
 	if droppedTool {
 		st.blocked = true

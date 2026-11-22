@@ -63,6 +63,7 @@ type ActivityEntry struct {
 
 // Status reflects the current dashboard-managed proxy state.
 type Status struct {
+	Version       string `json:"version,omitempty"`
 	ProxyRunning  bool   `json:"proxy_running"`
 	ListenAddr    string `json:"listen_addr"`
 	ClientBaseURL string `json:"client_base_url"`
@@ -97,14 +98,20 @@ type ProxyRequest struct {
 
 // Config configures the dashboard server.
 type Config struct {
-	ListenAddr string
-	Token      string
-	Providers  *ProviderStore
-	Activity   *ActivityLog
-	Engine     *inspect.Engine
-	ProxyLog   *proxy.Logger
-	ScanFn     func(req ScanRequest) (any, error)
-	AuditFn    func() (any, error)
+	Version          string
+	ListenAddr       string
+	Token            string
+	Providers        *ProviderStore
+	Activity         *ActivityLog
+	Engine           *inspect.Engine
+	ProxyLog         *proxy.Logger
+	MaxRequestBytes  int64
+	MaxResponseBytes int64
+	EgressDLP        proxy.DLPMode
+	LogAlertsOnly    bool
+	AllowPrivateScan bool
+	ScanFn           func(req ScanRequest) (any, error)
+	AuditFn          func() (any, error)
 }
 
 // Server is the dashboard HTTP server.
@@ -338,13 +345,14 @@ func cleanTags(tags []string) []string {
 	return out
 }
 
-// ActivityLog is a bounded, concurrency-safe ring buffer of events.
+// ActivityLog is a bounded, concurrency-safe ring buffer of events with pub/sub.
 type ActivityLog struct {
 	mu      sync.Mutex
 	entries []ActivityEntry
 	max     int
 	alerts  int
 	blocks  int
+	subs    map[chan ActivityEntry]struct{}
 }
 
 // NewActivityLog creates a ring buffer for up to max entries.
@@ -352,10 +360,37 @@ func NewActivityLog(max int) *ActivityLog {
 	if max <= 0 {
 		max = 500
 	}
-	return &ActivityLog{entries: make([]ActivityEntry, 0, max), max: max}
+	return &ActivityLog{
+		entries: make([]ActivityEntry, 0, max),
+		max:     max,
+		subs:    make(map[chan ActivityEntry]struct{}),
+	}
 }
 
-// Add pushes an entry, evicting oldest if full.
+// Subscribe registers a live activity listener. Slow consumers drop events rather
+// than stalling proxy traffic.
+func (al *ActivityLog) Subscribe() (<-chan ActivityEntry, func()) {
+	ch := make(chan ActivityEntry, 64)
+	al.mu.Lock()
+	if al.subs == nil {
+		al.subs = make(map[chan ActivityEntry]struct{})
+	}
+	al.subs[ch] = struct{}{}
+	al.mu.Unlock()
+
+	var once sync.Once
+	unsub := func() {
+		once.Do(func() {
+			al.mu.Lock()
+			delete(al.subs, ch)
+			close(ch)
+			al.mu.Unlock()
+		})
+	}
+	return ch, unsub
+}
+
+// Add pushes an entry, evicting oldest if full, and broadcasts to subscribers.
 func (al *ActivityLog) Add(e ActivityEntry) {
 	al.mu.Lock()
 	defer al.mu.Unlock()
@@ -371,6 +406,12 @@ func (al *ActivityLog) Add(e ActivityEntry) {
 		al.alerts++
 	case "blocked":
 		al.blocks++
+	}
+	for ch := range al.subs {
+		select {
+		case ch <- e:
+		default:
+		}
 	}
 }
 
@@ -404,20 +445,40 @@ func (al *ActivityLog) Clear() {
 
 // ProxyManager owns the dashboard-managed local proxy.
 type ProxyManager struct {
-	mu       sync.Mutex
-	server   *http.Server
-	provider Provider
-	listen   string
-	mode     proxy.Mode
-	started  time.Time
-	engine   *inspect.Engine
-	logger   *proxy.Logger
-	activity *ActivityLog
+	mu               sync.Mutex
+	server           *http.Server
+	provider         Provider
+	listen           string
+	mode             proxy.Mode
+	started          time.Time
+	engine           *inspect.Engine
+	logger           *proxy.Logger
+	activity         *ActivityLog
+	providers        *ProviderStore
+	maxRequestBytes  int64
+	maxResponseBytes int64
+	egressDLP        proxy.DLPMode
+	logAlertsOnly    bool
 }
 
 // NewProxyManager creates a stopped proxy manager.
 func NewProxyManager(engine *inspect.Engine, logger *proxy.Logger, activity *ActivityLog) *ProxyManager {
 	return &ProxyManager{engine: engine, logger: logger, activity: activity, mode: proxy.ModeMonitor, listen: defaultProxyListen}
+}
+
+func newProxyManagerFromConfig(cfg Config) *ProxyManager {
+	return &ProxyManager{
+		engine:           cfg.Engine,
+		logger:           cfg.ProxyLog,
+		activity:         cfg.Activity,
+		providers:        cfg.Providers,
+		maxRequestBytes:  cfg.MaxRequestBytes,
+		maxResponseBytes: cfg.MaxResponseBytes,
+		egressDLP:        cfg.EgressDLP,
+		logAlertsOnly:    cfg.LogAlertsOnly,
+		mode:             proxy.ModeMonitor,
+		listen:           defaultProxyListen,
+	}
 }
 
 // Start switches the local proxy to a provider profile.
@@ -442,18 +503,44 @@ func (pm *ProxyManager) Start(p Provider, listen, modeStr string) error {
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	pm.stopLocked(context.Background())
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = pm.stopLocked(stopCtx)
+	cancel()
 
-	h := proxy.New(proxy.Config{
-		Upstream: up,
-		Engine:   pm.engine,
-		Mode:     mode,
-		Logger:   pm.logger,
+	baseCfg := proxy.Config{
+		Upstream:         up,
+		Engine:           pm.engine,
+		Mode:             mode,
+		EgressDLP:        pm.egressDLP,
+		LogAlertsOnly:    pm.logAlertsOnly,
+		Logger:           pm.logger,
+		MaxRequestBytes:  pm.maxRequestBytes,
+		MaxResponseBytes: pm.maxResponseBytes,
 		OnDecision: func(d proxy.Decision) {
 			pm.recordDecision(p, d)
 		},
-	})
-	recorder := proxyActivityRecorder{provider: p.Name, activity: pm.activity, next: h}
+	}
+	defaultProxy := proxy.New(baseCfg)
+	var handler http.Handler = defaultProxy
+	if pm.providers != nil {
+		handler = proxy.NewRouter(defaultProxy, baseCfg, func(id string) (*url.URL, bool) {
+			prov, ok := pm.providers.Get(id)
+			if !ok {
+				return nil, false
+			}
+			parsed, err := url.Parse(prov.BaseURL)
+			if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+				return nil, false
+			}
+			return parsed, true
+		})
+	}
+	recorder := proxyActivityRecorder{
+		provider:  p.Name,
+		providers: pm.providers,
+		activity:  pm.activity,
+		next:      handler,
+	}
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           recorder,
@@ -495,27 +582,52 @@ func (pm *ProxyManager) stopLocked(ctx context.Context) error {
 	pm.provider = Provider{}
 	pm.started = time.Time{}
 	err := srv.Shutdown(ctx)
+	if err != nil {
+		_ = srv.Close()
+	}
 	pm.activity.Add(ActivityEntry{Type: "proxy", Provider: provider, Verdict: "stopped", Message: "Proxy stopped"})
 	return err
 }
 
+type multiReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
 type proxyActivityRecorder struct {
-	provider string
-	activity *ActivityLog
-	next     http.Handler
+	provider  string
+	providers *ProviderStore
+	activity  *ActivityLog
+	next      http.Handler
 }
 
 func (r proxyActivityRecorder) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	body, _ := io.ReadAll(io.LimitReader(req.Body, 4096))
-	req.Body.Close()
-	req.Body = io.NopCloser(bytes.NewReader(body))
+	provName := r.provider
+	if r.providers != nil && strings.HasPrefix(req.URL.Path, "/p/") {
+		rest := strings.TrimPrefix(req.URL.Path, "/p/")
+		if id, _, _ := strings.Cut(rest, "/"); id != "" {
+			if p, ok := r.providers.Get(id); ok {
+				provName = p.Name
+			}
+		}
+	}
+
+	var head []byte
+	if req.Body != nil {
+		origBody := req.Body
+		head, _ = io.ReadAll(io.LimitReader(origBody, 4096))
+		req.Body = multiReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(head), origBody),
+			Closer: origBody,
+		}
+	}
 	r.activity.Add(ActivityEntry{
 		Type:        "request",
-		Provider:    r.provider,
+		Provider:    provName,
 		Message:     fmt.Sprintf("REQUEST %s %s", req.Method, req.URL.Path),
 		Path:        req.URL.Path,
 		Method:      req.Method,
-		RequestBody: truncateForActivity(string(body), 800),
+		RequestBody: inspect.Redact(truncateForActivity(string(head), 800)),
 	})
 	r.next.ServeHTTP(w, req)
 }
@@ -550,11 +662,9 @@ func (pm *ProxyManager) recordDecision(p Provider, d proxy.Decision) {
 		}
 	}
 	entryType := d.Verdict
-	if entryType == "clean" {
-		entryType = "clean"
-	} else if entryType == "blocked" {
-		entryType = "blocked"
-	} else {
+	switch entryType {
+	case "clean", "blocked":
+	default:
 		entryType = "alert"
 	}
 	pm.activity.Add(ActivityEntry{
@@ -584,10 +694,10 @@ func isLocalListenAddr(addr string) bool {
 	if err != nil {
 		return false
 	}
-	if host == "localhost" {
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
-	ip := net.ParseIP(host)
+	ip := net.ParseIP(strings.Trim(host, "[]"))
 	return ip != nil && ip.IsLoopback()
 }
 
@@ -596,6 +706,6 @@ func isLocalRequest(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	ip := net.ParseIP(host)
+	ip := net.ParseIP(strings.Trim(host, "[]"))
 	return ip != nil && ip.IsLoopback()
 }
